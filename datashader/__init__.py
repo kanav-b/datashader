@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+# from .cre_numba_init import *
+print("is this working?")
+
 from packaging.version import Version
 
 from .__version import __version__  # noqa: F401

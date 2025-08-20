@@ -40,6 +40,11 @@ except ImportError:
     GeometryDtype = type(None)
 
 
+# NOTE: This import must be early to ensure Numba cache dir and precise caching is initialized
+import datashader.cre_numba_init  # initialize precise Numba caching and cache dirs
+
+
+
 class VisibleDeprecationWarning(UserWarning):
     """Visible deprecation warning.
 
@@ -49,8 +54,13 @@ class VisibleDeprecationWarning(UserWarning):
     """
 
 
-ngjit = nb.jit(nopython=True, nogil=True)
-ngjit_parallel = nb.jit(nopython=True, nogil=True, parallel=True)
+#-----this is the old code------
+# ngjit = nb.jit(nopython=True, nogil=True)
+# ngjit_parallel = nb.jit(nopython=True, nogil=True, parallel=True)
+#-----------------------------
+ngjit = nb.jit(nopython=True, nogil=True, cache=True)
+ngjit_parallel = nb.jit(nopython=True, nogil=True, parallel=True, cache=True)
+
 
 # Get and save the Numba version, will be used to limit functionality
 numba_version = tuple([int(x) for x in re.match(
@@ -93,7 +103,11 @@ class Expr:
 
 
 class Dispatcher:
-    """Simple single dispatch."""
+    """Simple single dispatch.
+
+    This class is compatible with monkey-patching for precise caching via
+    Dispatcher.enable_caching = enable_precise_caching (see cre_numba_init.py).
+    """
     def __init__(self):
         self._lookup = {}
 

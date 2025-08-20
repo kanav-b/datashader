@@ -8,6 +8,13 @@ from numba import literal_unroll
 import numpy as np
 import xarray as xr
 
+import numba as nb, datashader as ds
+
+
+# --- disk-backed emission for generated @njit functions ---
+# For AA kernel caching
+from .cre_cache_helpers import unique_hash, source_to_cache, import_from_cached, import_module_from_cached
+
 from .antialias import AntialiasCombination
 from .reductions import SpecialColumn, UsesCudaMutex, by, category_codes, summary
 from .utils import (isnull, ngjit,
@@ -31,6 +38,58 @@ __all__ = ['compile_components']
 
 
 logger = logging.getLogger(__name__)
+
+# --- disk-backed emission for generated @njit functions ---
+# Writes the generated function to a stable on-disk module keyed by a hash of
+# the spec + function body, then imports it and returns the callable.
+# This enables reliable reuse across processes and runs, and plays nicely with
+# Numba's own cache because the function has a real filename.
+
+def _cache_emit_njit(func_name: str, lines: list[str], cache_key_parts: list, *,
+                    extra_imports: list[str] | None = None, bindings: dict[str, object] | None = None):
+    # Build a deterministic source file containing a single @njit function.
+    # `lines` must start with `def {func_name}(...):`.
+    header = [
+        "import numpy as np",
+        "from numba import njit, literal_unroll",
+        # Import the in-place combine kernels that the generated code may call
+        "from datashader.utils import (",
+        "    nanmax_in_place, nanmin_in_place, nansum_in_place,",
+        "    nanfirst_in_place, nanlast_in_place,",
+        "    nanmax_n_in_place_3d, nanmax_n_in_place_4d,",
+        "    nanmin_n_in_place_3d, nanmin_n_in_place_4d,",
+        "    nanfirst_n_in_place_3d, nanfirst_n_in_place_4d,",
+        "    nanlast_n_in_place_3d, nanlast_n_in_place_4d,",
+        "    row_min_in_place, row_min_n_in_place_3d, row_min_n_in_place_4d,",
+        "    row_max_in_place, row_max_n_in_place_3d, row_max_n_in_place_4d,",
+        ")",
+        "",
+    ]
+    if extra_imports:
+        header.extend(extra_imports)
+        header.append("")
+
+    body = ["@njit(nopython=True, nogil=True, cache=True)"] + lines
+    source = "\n".join(header + body) + "\n"
+
+    # Create a stable hash from the spec and the function body.
+    # The module group name is kept constant so all DS kernels live under one path.
+    h = unique_hash(tuple(cache_key_parts) + ("\n".join(lines),))
+    name = "datashader_kernels"
+
+    # Write and import the cached module
+    source_to_cache(name, h, source)
+    if bindings:
+        mod = import_module_from_cached(name, h)
+        for k, v in bindings.items():
+            setattr(mod, k, v)
+        return getattr(mod, func_name)   # already @njit(cache=True)
+    mod_dict = import_from_cached(name, h, [func_name])
+    return mod_dict[func_name]
+
+
+    # mod_dict = import_from_cached(name, h, [func_name])
+    # return mod_dict[func_name]
 
 
 @memoize
@@ -243,8 +302,20 @@ def make_antialias_stage_2_functions(antialias_stage_2, bases, cuda, partitioned
                 f"        {func.__name__}(aggs_and_copies[{i}][1], aggs_and_copies[{i}][0])")
     code = "\n".join(lines)
     logger.debug(code)
-    exec(code, namespace)
-    aa_stage_2_accumulate = ngjit(namespace["aa_stage_2_accumulate"])
+    # Build a spec key sensitive to AA settings and the chosen combine funcs
+    spec_parts = [
+        "aa_stage_2_accumulate",
+        tuple(str(f.__name__) for f in funcs),
+        tuple(bool(b) for b in base_is_where),
+        tuple(bool(n) for n in next_base_is_where),
+        tuple(bool(c) for c in aa_categorical),
+    ]
+    aa_stage_2_accumulate = _cache_emit_njit(
+        "aa_stage_2_accumulate",
+        lines,
+        spec_parts,
+        extra_imports=["# namespace helpers are resolved via imports above"],
+    )
 
     # aa_stage_2_clear
     if np.any(np.isnan(aa_zeroes)):
@@ -255,8 +326,16 @@ def make_antialias_stage_2_functions(antialias_stage_2, bases, cuda, partitioned
         lines.append(f"    aggs_and_copies[{i}][0].fill({aa_zero})")
     code = "\n".join(lines)
     logger.debug(code)
-    exec(code, namespace)
-    aa_stage_2_clear = ngjit(namespace["aa_stage_2_clear"])
+    spec_parts = [
+        "aa_stage_2_clear",
+        tuple(float(z) for z in aa_zeroes.ravel()) if hasattr(aa_zeroes, "ravel") else tuple(aa_zeroes),
+    ]
+    aa_stage_2_clear = _cache_emit_njit(
+        "aa_stage_2_clear",
+        lines,
+        spec_parts,
+        extra_imports=["nan = np.nan" if "nan" in code else ""],
+    )
 
     # aa_stage_2_copy_back
     @ngjit
@@ -467,8 +546,49 @@ def make_append(bases, cols, calls, glyph, antialias):
                 '    {2}'
                 ).format(subscript, ', '.join(signature), '\n    '.join(body))
     logger.debug(code)
-    exec(code, namespace)
-    return ngjit(namespace['append']), any_uses_cuda_mutex
+
+    # --- disk-backed append emission with pre-binding of globals ---
+
+    # Bind every callable that the generated code refers to (the per-reduction
+    # kernels you stored into `namespace` with unique names).
+    bindings = {k: v for k, v in namespace.items() if callable(v)}
+
+    # Bind helpers that may be referenced by the generated code.
+    if need_isnull:
+        bindings["isnull"] = isnull
+    if any_uses_cuda_mutex:
+        bindings["cuda_mutex_lock"] = cuda_mutex_lock
+        bindings["cuda_mutex_unlock"] = cuda_mutex_unlock
+
+    # Build a spec that changes whenever codegen or any bound closure meaningfully changes.
+    # Include glyph dimensionality, mutex usage, antialias flag, and bytecode of the
+    # per-reduction callables (from `calls`).
+    funcs_in_order = [call[0] for call in calls]
+    func_codes = [
+        getattr(f, "__code__", None).co_code if hasattr(f, "__code__") else str(f)
+        for f in funcs_in_order
+    ]
+    spec_parts = [
+        "append",
+        glyph.ndims,
+        bool(any_uses_cuda_mutex),
+        bool(need_isnull),
+        bool(antialias),
+        tuple(func_codes),
+        ("versions", nb.__version__, ds.__version__),
+    ]
+
+    # Emit as a real module so Numba can persist compiled specializations to disk.
+    # `_cache_emit_njit` expects a list of source lines where the first line is `def append(...):`.
+    lines = code.split("\n")
+    append_fn = _cache_emit_njit(
+        "append",
+        lines,
+        spec_parts,
+        bindings=bindings,
+    )
+
+    return append_fn, any_uses_cuda_mutex
 
 
 def make_combine(bases, dshapes, temps, combine_temps, antialias, cuda, partitioned):

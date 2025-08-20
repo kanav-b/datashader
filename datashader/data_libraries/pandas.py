@@ -7,7 +7,7 @@ from datashader.compiler import compile_components
 from datashader.glyphs.points import _PointLike, _GeometryLike
 from datashader.glyphs.area import _AreaToLineLike
 from datashader.glyphs.line import LinesXarrayCommonX
-from datashader.utils import Dispatcher
+from datashader.utils import Dispatcher #---remember this please------
 
 __all__ = ()
 
