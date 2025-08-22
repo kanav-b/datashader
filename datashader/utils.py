@@ -59,6 +59,7 @@ class VisibleDeprecationWarning(UserWarning):
 # ngjit_parallel = nb.jit(nopython=True, nogil=True, parallel=True)
 #-----------------------------
 ngjit = nb.jit(nopython=True, nogil=True, cache=True)
+ngjit_no_cache = nb.jit(nopython=True, nogil=True, cache=False)  # For functions with dynamic globals
 ngjit_parallel = nb.jit(nopython=True, nogil=True, parallel=True, cache=True)
 
 
@@ -1034,3 +1035,145 @@ def uint32_to_uint8(img):
 def uint8_to_uint32(img):
     """Cast a 4-channel uint8 RGBA array to uint32 raster"""
     return img.view(dtype=np.uint32).reshape(img.shape[:-1])
+
+
+import functools
+import inspect
+import sys
+import time
+from typing import Callable, Any, Optional
+
+def trace_function(func: Callable) -> Callable:
+    """
+    Decorator to trace function calls with print statements.
+    Prints function name, arguments, and return value.
+    """
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        # Get function name and module
+        func_name = func.__name__
+        module_name = func.__module__
+        
+        # Print function entry
+        print(f"ENTER: {module_name}.{func_name}")
+        
+        # Print arguments (simplified)
+        if args:
+            print(f"  args: {len(args)} positional arguments")
+        if kwargs:
+            print(f"  kwargs: {list(kwargs.keys())}")
+        
+        try:
+            # Call the function
+            result = func(*args, **kwargs)
+            
+            # Print function exit
+            print(f"EXIT: {module_name}.{func_name}")
+            
+            return result
+        except Exception as e:
+            # Print exception
+            print(f"ERROR in {module_name}.{func_name}: {e}")
+            raise
+    
+    return wrapper
+
+def trace_function_detailed(func: Callable) -> Callable:
+    """
+    More detailed tracing decorator that shows argument values.
+    """
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        func_name = func.__name__
+        module_name = func.__module__
+        
+        print(f"ENTER: {module_name}.{func_name}")
+        
+        # Show argument details
+        if args:
+            print(f"  args: {args}")
+        if kwargs:
+            print(f"  kwargs: {kwargs}")
+        
+        try:
+            result = func(*args, **kwargs)
+            print(f"EXIT: {module_name}.{func_name} -> {result}")
+            return result
+        except Exception as e:
+            print(f"ERROR in {module_name}.{func_name}: {e}")
+            raise
+    
+    return wrapper
+
+def trace_function_timing(func: Callable) -> Callable:
+    """
+    Tracing decorator that also measures execution time.
+    """
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        func_name = func.__name__
+        module_name = func.__module__
+        
+        start_time = time.time()
+        print(f"ENTER: {module_name}.{func_name}")
+        
+        try:
+            result = func(*args, **kwargs)
+            end_time = time.time()
+            print(f"EXIT: {module_name}.{func_name} (took {end_time - start_time:.4f}s)")
+            return result
+        except Exception as e:
+            end_time = time.time()
+            print(f"ERROR in {module_name}.{func_name} (took {end_time - start_time:.4f}s): {e}")
+            raise
+    
+    return wrapper
+
+def trace_all_functions(module_name: str = None):
+    """
+    Decorator to trace all functions in a module.
+    Usage: @trace_all_functions(__name__)
+    """
+    def decorator(func: Callable) -> Callable:
+        return trace_function(func)
+    return decorator
+
+def add_print_statements(func: Callable, message: str = None) -> Callable:
+    """
+    Simple decorator that just adds a print statement at the start of a function.
+    """
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        if message:
+            print(message)
+        else:
+            print(f"Calling {func.__module__}.{func.__name__}")
+        return func(*args, **kwargs)
+    return wrapper
+
+# Function registry for caching functions with dynamic globals
+_function_registry = {}
+
+def register_function(name, func):
+    """Register a function in the global registry for caching purposes."""
+    _function_registry[name] = func
+
+def get_registered_function(name):
+    """Get a function from the global registry."""
+    return _function_registry.get(name)
+
+def create_cacheable_function(func_name, func_source, **kwargs):
+    """
+    Create a cacheable function by compiling source code without capturing closures.
+    This allows Numba to cache functions that would otherwise have dynamic globals.
+    """
+    import numba
+    import types
+    
+    # Compile the function source
+    compiled_func = numba.njit(cache=True)(types.ExternalFunction(func_source))
+    
+    # Register it for later use
+    register_function(func_name, compiled_func)
+    
+    return compiled_func

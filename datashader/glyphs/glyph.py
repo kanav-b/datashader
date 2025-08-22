@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 import xarray as xr
 
-from datashader.utils import Expr, ngjit
+from datashader.utils import Expr, ngjit, trace_function
 from datashader.macros import expand_varargs
 
 try:
@@ -111,6 +111,7 @@ class Glyph(Expr):
                 return df[columns].to_gpu_array()
             return df[columns].as_gpu_matrix()
 
+    @trace_function
     def expand_aggs_and_cols(self, append):
         """
         Create a decorator that can be used on functions that accept

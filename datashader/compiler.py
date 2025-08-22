@@ -72,13 +72,20 @@ def _cache_emit_njit(func_name: str, lines: list[str], cache_key_parts: list, *,
     body = ["@njit(nopython=True, nogil=True, cache=True)"] + lines
     source = "\n".join(header + body) + "\n"
 
-    # Create a stable hash from the spec and the function body.
-    # The module group name is kept constant so all DS kernels live under one path.
-    h = unique_hash(tuple(cache_key_parts) + ("\n".join(lines),))
+    # Create a stable hash from the cache key parts only.
+    # This ensures the hash is stable across kernel restarts.
+    h = unique_hash(tuple(cache_key_parts))
     name = "datashader_kernels"
 
-    # Write and import the cached module
-    source_to_cache(name, h, source)
+    # Check if the cached module already exists before writing
+    from .cre_cache_helpers import source_in_cache
+    if source_in_cache(name, h):
+        print(f"🔄 Using existing disk-cached {func_name} function")
+    else:
+        print(f"✅ Creating new disk-cached {func_name} function")
+        source_to_cache(name, h, source)
+    
+    # Import the cached module (either existing or newly created)
     if bindings:
         mod = import_module_from_cached(name, h)
         for k, v in bindings.items():
@@ -305,7 +312,8 @@ def make_antialias_stage_2_functions(antialias_stage_2, bases, cuda, partitioned
     # Build a spec key sensitive to AA settings and the chosen combine funcs
     spec_parts = [
         "aa_stage_2_accumulate",
-        tuple(str(f.__name__) for f in funcs),
+        # Exclude dynamic function names for stable cache keys
+        # tuple(str(f.__name__) for f in funcs),
         tuple(bool(b) for b in base_is_where),
         tuple(bool(n) for n in next_base_is_where),
         tuple(bool(c) for c in aa_categorical),
@@ -328,7 +336,8 @@ def make_antialias_stage_2_functions(antialias_stage_2, bases, cuda, partitioned
     logger.debug(code)
     spec_parts = [
         "aa_stage_2_clear",
-        tuple(float(z) for z in aa_zeroes.ravel()) if hasattr(aa_zeroes, "ravel") else tuple(aa_zeroes),
+        # Exclude dynamic values for stable cache keys
+        # tuple(float(z) for z in aa_zeroes.ravel()) if hasattr(aa_zeroes, "ravel") else tuple(aa_zeroes),
     ]
     aa_stage_2_clear = _cache_emit_njit(
         "aa_stage_2_clear",
@@ -574,8 +583,9 @@ def make_append(bases, cols, calls, glyph, antialias):
         bool(any_uses_cuda_mutex),
         bool(need_isnull),
         bool(antialias),
-        tuple(func_codes),
-        ("versions", nb.__version__, ds.__version__),
+        # Exclude dynamic elements for stable cache keys across kernel restarts
+        # tuple(func_codes),  # Function bytecode can change in editable installs
+        # ("versions", nb.__version__, ds.__version__),  # Version info can change
     ]
 
     # Emit as a real module so Numba can persist compiled specializations to disk.

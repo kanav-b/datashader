@@ -13,7 +13,7 @@ from xarray import DataArray, Dataset
 from .utils import Dispatcher, ngjit, calc_res, calc_bbox, orient_array, \
     dshape_from_xarray_dataset
 from .utils import get_indices, dshape_from_pandas, dshape_from_dask
-from .utils import Expr # noqa (API import)
+from .utils import Expr, trace_function # noqa (API import)
 from .resampling import resample_2d, resample_2d_distributed
 from . import reductions as rd
 
@@ -228,6 +228,7 @@ class Canvas:
 
         return bypixel(source, self, glyph, agg)
 
+    @trace_function
     def line(self, source, x=None, y=None, agg=None, axis=0, geometry=None,
              line_width=0, antialias=False):
         """Compute a reduction by pixel, mapping data to pixels as one or
@@ -1323,6 +1324,7 @@ x- and y-coordinate arrays must have 1 or 2 dimensions.
             return None
 
 
+@trace_function
 def bypixel(source, canvas, glyph, agg, *, antialias=False):
     """Compute an aggregate grouped by pixel sized bins.
 
