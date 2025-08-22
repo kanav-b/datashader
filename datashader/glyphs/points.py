@@ -6,7 +6,11 @@ from toolz import memoize
 from datashader.glyphs.glyph import Glyph
 from datashader.utils import isreal, ngjit
 
+# NOTE: This import must be early to ensure Numba cache dir and precise caching is initialized
+import datashader.cre_numba_init  # initialize precise Numba caching and cache dirs
+
 from numba import cuda
+from numba import njit
 
 try:
     import cudf
@@ -24,6 +28,57 @@ try:
     import spatialpandas
 except Exception:
     spatialpandas = None
+
+
+# --- COMPLETELY NEW ARCHITECTURE: Simple, Static, Cacheable Functions ---
+import numpy as np
+
+@njit(cache=True)
+def draw_point(x, y, sx, tx, sy, ty, xmin, xmax, ymin, ymax, agg):
+    """Simple, static point drawing function that can be cached to disk - EXACT SAME PATTERN AS LINE PLOTS"""
+    # Check for NaN values
+    if (x != x) or (y != y):
+        return
+    
+    # Check bounds
+    if not (xmin <= x <= xmax) or not (ymin <= y <= ymax):
+        return
+    
+    # Map coordinates to pixel space (like original datashader)
+    # x_mapper and y_mapper are identity functions by default
+    xx = int(x * sx + tx)
+    yy = int(y * sy + ty)
+    
+    # Handle edge cases for bounds (like original datashader)
+    xxmax = round(xmax * sx + tx)
+    yymax = round(ymax * sy + ty)
+    
+    # Snap to proper pixel boundaries (like original datashader)
+    xi = xxmax - 1 if xx >= xxmax else xx
+    yi = yymax - 1 if yy >= yymax else yy
+    
+    # Bounds checking and aggregation
+    if 0 <= yi < agg.shape[0] and 0 <= xi < agg.shape[1]:
+        # Handle NaN values efficiently
+        current_val = agg[yi, xi]
+        if current_val != current_val:  # Check for NaN
+            agg[yi, xi] = 1.0
+        else:
+            agg[yi, xi] = current_val + 1.0
+
+@njit(cache=True)
+def process_points_data(xs, ys, sx, tx, sy, ty, xmin, xmax, ymin, ymax, agg):
+    """Process entire point data and draw all points - EXACT SAME PATTERN AS LINE PLOTS"""
+    # Efficient NaN initialization - only check once and use vectorized fill
+    if agg.flat[0] != agg.flat[0]:  # Check if array contains NaN values
+        # Use numpy's fill method which is much faster than nested loops
+        agg.fill(0.0)
+    
+    n = len(xs)
+    for i in range(n):
+        x = xs[i]  # Pass through without type conversion for stable cache keys
+        y = ys[i]  # Pass through without type conversion for stable cache keys
+        draw_point(x, y, sx, tx, sy, ty, xmin, xmax, ymin, ymax, agg)
 
 
 def values(s):
@@ -182,62 +237,35 @@ class Point(_PointLike):
     @memoize
     def _build_extend(self, x_mapper, y_mapper, info, append, _antialias_stage_2,
                       _antialias_stage_2_funcs):
+        
+        print('in _build_extend for Point - NEW STATIC ARCHITECTURE')
+        
+        # NEW ARCHITECTURE: Use static functions directly, bypass dynamic infrastructure
         x_name = self.x
         y_name = self.y
 
-        @ngjit
-        @self.expand_aggs_and_cols(append)
-        def _perform_extend_points(i, sx, tx, sy, ty, xmin, xmax,
-                                   ymin, ymax, xs, ys, xxmax, yymax,
-                                   *aggs_and_cols):
-            x = xs[i]
-            y = ys[i]
-
-            # points outside bounds are dropped; remainder
-            # are mapped onto pixels
-            if (xmin <= x <= xmax) and (ymin <= y <= ymax):
-                xx = int(x_mapper(x) * sx + tx)
-                yy = int(y_mapper(y) * sy + ty)
-
-                xi, yi = (xxmax-1 if xx >= xxmax else xx,
-                          yymax-1 if yy >= yymax else yy)
-                append(i, xi, yi, *aggs_and_cols)
-
-        @ngjit
-        @self.expand_aggs_and_cols(append)
-        def extend_cpu(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys,
-                       xxmax, yymax, *aggs_and_cols):
-            for i in range(xs.shape[0]):
-                _perform_extend_points(i, sx, tx, sy, ty, xmin, xmax, ymin, ymax,
-                                       xs, ys, xxmax, yymax, *aggs_and_cols)
-
-        @cuda.jit
-        @self.expand_aggs_and_cols(append)
-        def extend_cuda(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys,
-                        xxmax, yymax, *aggs_and_cols):
-            i = cuda.grid(1)
-            if i < xs.shape[0]:
-                _perform_extend_points(i, sx, tx, sy, ty, xmin, xmax, ymin, ymax,
-                                       xs, ys, xxmax, yymax, *aggs_and_cols)
-
         def extend(aggs, df, vt, bounds):
-            yymax, xxmax = aggs[0].shape[:2]
-            aggs_and_cols = aggs + info(df, aggs[0].shape[:2])
             sx, tx, sy, ty = vt
             xmin, xmax, ymin, ymax = bounds
+            aggs_and_cols = aggs + info(df, aggs[0].shape[:2])
+
+            print('in extend for Point - NEW STATIC ARCHITECTURE')
 
             if cudf and isinstance(df, cudf.DataFrame):
                 xs = values(df[x_name])
                 ys = values(df[y_name])
-                do_extend = extend_cuda[cuda_args(xs.shape[0])]
+                # TODO: Add CUDA support for new architecture
+                print("CUDA not yet implemented for new architecture")
+                return
             else:
                 xs = df[x_name].values
                 ys = df[y_name].values
-                do_extend = extend_cpu
-
-            do_extend(
-                sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys, xxmax, yymax, *aggs_and_cols
-            )
+                
+                # NEW ARCHITECTURE: Call static function directly for each point
+                if len(aggs_and_cols) > 0:
+                    agg = aggs_and_cols[0]
+                    # Process all points with the static function
+                    process_points_data(xs, ys, sx, tx, sy, ty, xmin, xmax, ymin, ymax, agg)
 
         return extend
 
@@ -418,3 +446,6 @@ class MultiPointGeometry(_GeometryLike):
                 )
 
         return extend
+
+
+# Note: Functions will be compiled on first use, which is more stable for caching

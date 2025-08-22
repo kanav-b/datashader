@@ -9,7 +9,7 @@ import datashader.cre_numba_init  # initialize precise Numba caching and cache d
 # --- COMPLETELY NEW ARCHITECTURE: Simple, Static, Cacheable Functions ---
 from numba import njit
 
-@njit(cache=True, nogil=True)
+@njit(cache=True)
 def draw_line_segment(
         x0, y0, x1, y1, sx, tx, sy, ty, xmin, xmax, ymin, ymax, agg,
 ):
@@ -86,7 +86,7 @@ def draw_line_segment(
         else:
             agg[y, x] = current_val + 1.0
 
-@njit(cache=True, nogil=True)
+@njit(cache=True)
 def draw_line_segment_antialiased(
         x0, y0, x1, y1, sx, tx, sy, ty, xmin, xmax, ymin, ymax, agg, line_width,
 ):
@@ -189,7 +189,7 @@ def draw_line_segment_antialiased(
                         else:
                             agg[py, px] = current_val + intensity
 
-@njit(cache=True, nogil=True)
+@njit(cache=True)
 def process_line_data(
         xs, ys, sx, tx, sy, ty, xmin, xmax, ymin, ymax, agg, line_width=0.0,
 ):

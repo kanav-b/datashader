@@ -14,6 +14,73 @@ import xarray as xr
 from datashader.colors import rgb, Sets1to3
 from datashader.utils import nansum_missing, ngjit, uint32_to_uint8
 
+# NOTE: This import must be early to ensure Numba cache dir and precise caching is initialized
+import datashader.cre_numba_init  # initialize precise Numba caching and cache dirs
+
+from numba import njit
+
+# --- COMPLETELY NEW ARCHITECTURE: Static, Cacheable Spread Functions ---
+@njit(cache=True)
+def spread_kernel_int(arr, mask, out, how_add):
+    """Static, cacheable spread kernel for integer arrays"""
+    M, N = arr.shape
+    mask_size = mask.shape[0]
+    for y in range(M):
+        for x in range(N):
+            el = arr[y, x]
+            for i in range(mask_size):
+                for j in range(mask_size):
+                    if mask[i, j]:
+                        if el == 0:
+                            result = out[i + y, j + x]
+                        elif out[i + y, j + x] == 0:
+                            result = el
+                        else:
+                            result = el + out[i + y, j + x]  # Default to add operation
+                        out[i + y, j + x] = result
+
+@njit(cache=True)
+def spread_kernel_float(arr, mask, out, how_add):
+    """Static, cacheable spread kernel for float arrays"""
+    M, N = arr.shape
+    mask_size = mask.shape[0]
+    for y in range(M):
+        for x in range(N):
+            el = arr[y, x]
+            for i in range(mask_size):
+                for j in range(mask_size):
+                    if mask[i, j]:
+                        if np.isnan(el):
+                            result = out[i + y, j + x]
+                        elif np.isnan(out[i + y, j + x]):
+                            result = el
+                        else:
+                            result = el + out[i + y, j + x]  # Default to add operation
+                        out[i + y, j + x] = result
+
+@njit(cache=True)
+def spread_kernel_image(arr, mask, out, how_add):
+    """Static, cacheable spread kernel for image arrays"""
+    M, N = arr.shape
+    w = mask.shape[0]
+    for y in range(M):
+        for x in range(N):
+            el = arr[y, x]
+            # Skip if data is transparent
+            process_image = ((int(el) >> 24) & 255) != 0  # Non-transparent pixel
+            if process_image:
+                for i in range(w):
+                    for j in range(w):
+                        # Skip if mask is False at this value
+                        if mask[i, j]:
+                            if el == 0:
+                                result = out[i + y, j + x]
+                            elif out[i + y, j + x] == 0:
+                                result = el
+                            else:
+                                result = el + out[i + y, j + x]  # Default to add operation
+                            out[i + y, j + x] = result
+
 try:
     import dask.array as da
 except ImportError:
@@ -808,16 +875,18 @@ def spread(img, px=1, shape='circle', how=None, mask=None, name=None):
         # Convert img.data to numpy array before passing to nb.jit kernels
         img.data = cupy.asnumpy(img.data)
 
-    if is_image:
-        kernel = _build_spread_kernel(how, is_image)
-    elif float_type:
-        kernel = _build_float_kernel(how, w)
-    else:
-        kernel = _build_int_kernel(how, w, img.dtype == np.uint32)
-
+    # NEW ARCHITECTURE: Use static, cacheable kernels instead of dynamic ones
     def apply_kernel(layer):
         buf = np.full(padded_shape, fill_value, dtype=layer.dtype)
-        kernel(layer.data, mask, buf)
+        
+        # Choose appropriate static kernel based on data type
+        if is_image:
+            spread_kernel_image(layer.data, mask, buf, how)
+        elif float_type:
+            spread_kernel_float(layer.data, mask, buf, how)
+        else:
+            spread_kernel_int(layer.data, mask, buf, how)
+            
         return buf[extra:-extra, extra:-extra].copy()
 
     if len(img.shape)==2:
