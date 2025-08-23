@@ -302,8 +302,8 @@ def _build_draw_segment(append, map_onto_pixel, expand_aggs_and_cols, line_width
     linearstep_src = inspect.getsource(_linearstep)
     liang_barsky_src = inspect.getsource(_liang_barsky)
 
-    # Build the function source string
-    fn_src = f"""
+    # Build the function source string - FIXED: Use .format() instead of f-string for template variables
+    fn_src = """
 from numba import njit
 import numpy as np
 from datashader.cre_cache_helpers import import_from_cached
@@ -316,10 +316,16 @@ map_onto_pixel = import_from_cached("map_onto_pixel", "{map_hash}", ["map_onto_p
 {linearstep_src}
 {liang_barsky_src}
 
-@njit(nogil=True, cache=True)
+@njit(cache=True)
 def draw_segment(*args, **kwargs):
     raise NotImplementedError("draw_segment not implemented in cache stub.")
-"""
+""".format(
+        append_hash=append_hash,
+        map_hash=map_hash,
+        clamp_src=clamp_src,
+        linearstep_src=linearstep_src,
+        liang_barsky_src=liang_barsky_src
+    )
 
     # Write to cache
     source_to_cache(cache_name, cache_hash, fn_src)

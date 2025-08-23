@@ -58,9 +58,9 @@ class VisibleDeprecationWarning(UserWarning):
 # ngjit = nb.jit(nopython=True, nogil=True)
 # ngjit_parallel = nb.jit(nopython=True, nogil=True, parallel=True)
 #-----------------------------
-ngjit = nb.jit(nopython=True, nogil=True, cache=True)
-ngjit_no_cache = nb.jit(nopython=True, nogil=True, cache=False)  # For functions with dynamic globals
-ngjit_parallel = nb.jit(nopython=True, nogil=True, parallel=True, cache=True)
+ngjit = nb.jit(cache=True)
+ngjit_no_cache = nb.jit(cache=False)  # For functions with dynamic globals
+ngjit_parallel = nb.jit(parallel=True, cache=True)
 
 
 # Get and save the Numba version, will be used to limit functionality

@@ -1058,7 +1058,7 @@ def dynspread(img, threshold=0.5, max_px=3, shape='circle', how=None, name=None)
         return img
 
 
-@nb.jit(nopython=True, nogil=True, cache=True)
+@nb.jit(cache=True)
 def _array_density(arr, float_type, px=1):
     """Compute a density heuristic of an array.
 
@@ -1083,7 +1083,7 @@ def _array_density(arr, float_type, px=1):
     return has_neighbors/cnt if cnt else np.inf
 
 
-@nb.jit(nopython=True, nogil=True, cache=True)
+@nb.jit(cache=True)
 def _rgb_density(arr, px=1):
     """Compute a density heuristic of an image.
 

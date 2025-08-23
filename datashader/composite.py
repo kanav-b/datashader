@@ -26,7 +26,7 @@ def validate_operator(how, is_image):
                         % (how, ', '.join(repr(el[:-4]) for el in array_operators)))
 
 
-@nb.jit('(uint32,)', nopython=True, nogil=True, cache=True)
+@nb.jit('(uint32,)', cache=True)
 def extract_scaled(x):
     """Extract components as float64 values in [0.0, 1.0]"""
     r = np.float64(( x        & 255) / 255)
@@ -36,8 +36,7 @@ def extract_scaled(x):
     return r, g, b, a
 
 
-@nb.jit('(float64, float64, float64, float64)', nopython=True,
-        nogil=True, cache=True)
+@nb.jit('(float64, float64, float64, float64)', cache=True)
 def combine_scaled(r, g, b, a):
     """Combine components in [0, 1] to rgba uint32"""
     r2 = min(255, np.uint32(r * 255))

@@ -69,7 +69,7 @@ def _cache_emit_njit(func_name: str, lines: list[str], cache_key_parts: list, *,
         header.extend(extra_imports)
         header.append("")
 
-    body = ["@njit(nopython=True, nogil=True, cache=True)"] + lines
+    body = ["@njit(cache=True)"] + lines
     source = "\n".join(header + body) + "\n"
 
     # Create a stable hash from the cache key parts only.
