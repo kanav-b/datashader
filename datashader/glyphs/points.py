@@ -181,28 +181,52 @@ class _PointLike(Glyph):
         return (self.x, self.y)
 
     def validate(self, in_dshape):
-        if not isreal(in_dshape.measure[str(self.x)]):
-            raise ValueError('x must be real')
-        elif not isreal(in_dshape.measure[str(self.y)]):
-            raise ValueError('y must be real')
+        # Handle both column names and column indices
+        if isinstance(self.x, (int, np.integer)):
+            # For column indices, we can't validate the datashape directly
+            # since in_dshape.measure doesn't support integer indexing
+            # We'll skip validation for column indices - let runtime handle it
+            pass
+        else:
+            # Validate column names as before
+            if not isreal(in_dshape.measure[str(self.x)]):
+                raise ValueError('x must be real')
+        
+        if isinstance(self.y, (int, np.integer)):
+            # For column indices, skip validation
+            pass
+        else:
+            # Validate column names as before
+            if not isreal(in_dshape.measure[str(self.y)]):
+                raise ValueError('y must be real')
 
     @property
     def x_label(self):
-        return self.x
+        # Always return string labels for xarray compatibility
+        return str(self.x)
 
     @property
     def y_label(self):
-        return self.y
+        # Always return string labels for xarray compatibility
+        return str(self.y)
 
     def required_columns(self):
         return [self.x, self.y]
 
     def compute_x_bounds(self, df):
-        bounds = self._compute_bounds(df[self.x])
+        # Handle both column names and column indices
+        if isinstance(self.x, (int, np.integer)):
+            bounds = self._compute_bounds(df.iloc[:, self.x])
+        else:
+            bounds = self._compute_bounds(df[self.x])
         return self.maybe_expand_bounds(bounds)
 
     def compute_y_bounds(self, df):
-        bounds = self._compute_bounds(df[self.y])
+        # Handle both column names and column indices
+        if isinstance(self.y, (int, np.integer)):
+            bounds = self._compute_bounds(df.iloc[:, self.y])
+        else:
+            bounds = self._compute_bounds(df[self.y])
         return self.maybe_expand_bounds(bounds)
 
     @memoize
@@ -258,8 +282,16 @@ class Point(_PointLike):
                 print("CUDA not yet implemented for new architecture")
                 return
             else:
-                xs = df[x_name].values
-                ys = df[y_name].values
+                # Handle both column names and column indices
+                if isinstance(x_name, (int, np.integer)):
+                    xs = df.iloc[:, x_name].values
+                else:
+                    xs = df[x_name].values
+                    
+                if isinstance(y_name, (int, np.integer)):
+                    ys = df.iloc[:, y_name].values
+                else:
+                    ys = df[y_name].values
                 
                 # NEW ARCHITECTURE: Call static function directly for each point
                 if len(aggs_and_cols) > 0:
