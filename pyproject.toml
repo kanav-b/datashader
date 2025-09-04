@@ -117,4 +117,6 @@ filterwarnings = [
     "ignore:The legacy Dask DataFrame implementation is deprecated:FutureWarning", # https://github.com/holoviz/spatialpandas/issues/146
     # 2025-04
     "ignore:The 'shapely.geos' module is deprecated, and will be removed in a future version:DeprecationWarning",
+    # Custom caching system warnings
+    "ignore:Cannot cache compiled function.*as it uses dynamic globals:numba.core.errors.NumbaWarning",
 ]
