@@ -87,6 +87,71 @@ def draw_line_segment(
             agg[y, x] = current_val + 1.0
 
 @njit(cache=True)
+def draw_line_segment_max(
+        x0, y0, x1, y1, sx, tx, sy, ty, xmin, xmax, ymin, ymax, agg, value,
+):
+    """Static line drawing that updates agg with max(value) per pixel."""
+    if (x0 != x0) or (y0 != y0) or (x1 != x1) or (y1 != y1):
+        return
+
+    xx0 = int(x0 * sx + tx)
+    yy0 = int(y0 * sy + ty)
+    xx1 = int(x1 * sx + tx)
+    yy1 = int(y1 * sy + ty)
+
+    xxmax = round(xmax * sx + tx)
+    yymax = round(ymax * sy + ty)
+    xx0 = xx0 - 1 if xx0 == xxmax else xx0
+    yy0 = yy0 - 1 if yy0 == yymax else yy0
+    xx1 = xx1 - 1 if xx1 == xxmax else xx1
+    yy1 = yy1 - 1 if yy1 == yymax else yy1
+
+    dx = abs(xx1 - xx0)
+    dy = abs(yy1 - yy0)
+    x, y = xx0, yy0
+    sx_step = 1 if xx0 < xx1 else -1
+    sy_step = 1 if yy0 < yy1 else -1
+
+    if dx > dy:
+        err = dx / 2.0
+        while x != xx1:
+            if 0 <= x < agg.shape[1] and 0 <= y < agg.shape[0]:
+                cur = agg[y, x]
+                if cur == cur:  # not NaN
+                    if value > cur:
+                        agg[y, x] = value
+                else:
+                    agg[y, x] = value
+            err -= dy
+            if err < 0:
+                y += sy_step
+                err += dx
+            x += sx_step
+    else:
+        err = dy / 2.0
+        while y != yy1:
+            if 0 <= x < agg.shape[1] and 0 <= y < agg.shape[0]:
+                cur = agg[y, x]
+                if cur == cur:
+                    if value > cur:
+                        agg[y, x] = value
+                else:
+                    agg[y, x] = value
+            err -= dx
+            if err < 0:
+                x += sx_step
+                err += dy
+            y += sy_step
+
+    if 0 <= x < agg.shape[1] and 0 <= y < agg.shape[0]:
+        cur = agg[y, x]
+        if cur == cur:
+            if value > cur:
+                agg[y, x] = value
+        else:
+            agg[y, x] = value
+
+@njit(cache=True)
 def draw_line_segment_antialiased(
         x0, y0, x1, y1, sx, tx, sy, ty, xmin, xmax, ymin, ymax, agg, line_width,
 ):
@@ -210,9 +275,22 @@ def process_line_data(
         else:
             draw_line_segment(x0, y0, x1, y1, sx, tx, sy, ty, xmin, xmax, ymin, ymax, agg)
 
+@njit(cache=True)
+def process_line_data_max(
+        xs, ys, sx, tx, sy, ty, xmin, xmax, ymin, ymax, agg, value,
+):
+    """Process line data and draw all segments with max aggregation of a scalar."""
+    n = len(xs)
+    for i in range(n - 1):
+        x0, y0 = xs[i], ys[i]
+        x1, y1 = xs[i + 1], ys[i + 1]
+        if (x0 != x0) or (y0 != y0) or (x1 != x1) or (y1 != y1):
+            continue
+        draw_line_segment_max(x0, y0, x1, y1, sx, tx, sy, ty, xmin, xmax, ymin, ymax, agg, value)
+
 from datashader.antialias import two_stage_agg
 from datashader.glyphs.points import _PointLike, _GeometryLike
-from datashader.utils import isnull, isreal, ngjit
+from datashader.utils import isnull, isreal, ngjit, ngjit_no_cache
 from numba import cuda
 import numba.types as nb_types
 
@@ -351,81 +429,6 @@ def _line_internal_build_extend(
     return draw_segment, antialias_stage_2_funcs
 
 
-# --- Caching helper for draw_segment ---
-def _build_draw_segment(append, map_onto_pixel, expand_aggs_and_cols, line_width, overwrite):
-    """
-    Build and cache the draw_segment function using disk-based caching.
-    This version ensures append and map_onto_pixel come from cached sources.
-    """
-    from datashader.cre_cache_helpers import (
-        unique_hash,
-        source_to_cache,
-        import_from_cached,
-    )
-    import inspect
-
-    # Compute cache hash for draw_segment
-    cache_hash = unique_hash([
-        getattr(append, "__name__", "append"),
-        getattr(map_onto_pixel, "__name__", "map_onto_pixel"),
-        line_width,
-        overwrite,
-    ])
-    cache_name = "draw_segment"
-
-    # Try to load from cache
-    try:
-        cached = import_from_cached(cache_name, cache_hash, ["draw_segment"])
-        return cached["draw_segment"]
-    except Exception:
-        pass
-
-    # --- Prepare cached imports for append and map_onto_pixel ---
-    append_hash = unique_hash([getattr(append, "__name__", "append")])
-    map_hash = unique_hash([getattr(map_onto_pixel, "__name__", "map_onto_pixel")])
-
-    # Inline helper function sources
-    from datashader.glyphs.line import _liang_barsky, _linearstep, _clamp
-    clamp_src = inspect.getsource(_clamp)
-    linearstep_src = inspect.getsource(_linearstep)
-    liang_barsky_src = inspect.getsource(_liang_barsky)
-
-    # Build the function source string - FIXED: Use .format() instead of f-string for template variables
-    fn_src = """
-from numba import njit
-import numpy as np
-from datashader.cre_cache_helpers import import_from_cached
-
-# Pull cached versions of dependencies
-append = import_from_cached("append", "{append_hash}", ["append"])["append"]
-map_onto_pixel = import_from_cached("map_onto_pixel", "{map_hash}", ["map_onto_pixel"])["map_onto_pixel"]
-
-{clamp_src}
-{linearstep_src}
-{liang_barsky_src}
-
-@njit(cache=True)
-def draw_segment(*args, **kwargs):
-    raise NotImplementedError("draw_segment not implemented in cache stub.")
-""".format(
-        append_hash=append_hash,
-        map_hash=map_hash,
-        clamp_src=clamp_src,
-        linearstep_src=linearstep_src,
-        liang_barsky_src=liang_barsky_src
-    )
-
-    # Write to cache
-    source_to_cache(cache_name, cache_hash, fn_src)
-
-    # Import from cache and return
-    cached = import_from_cached(cache_name, cache_hash, ["draw_segment"])
-
-    print(append.__name__, map_onto_pixel.__name__, "draw_segment cached with hash", cache_hash)
-
-    return cached["draw_segment"]
-
-
 class LineAxis0(_PointLike, _AntiAliasedLine):
     """A line, with vertices defined by ``x`` and ``y``.
 
@@ -488,7 +491,6 @@ class LineAxis0(_PointLike, _AntiAliasedLine):
             self, x_mapper, y_mapper, info, append, line_width, antialias_stage_2,
             antialias_stage_2_funcs):
         
-        print('in _internal_build_extend for LineAxis0 - NEW STATIC ARCHITECTURE')
         
         # NEW ARCHITECTURE: Use static functions directly, bypass dynamic infrastructure
         x_name = self.x
@@ -497,15 +499,14 @@ class LineAxis0(_PointLike, _AntiAliasedLine):
         def extend(aggs, df, vt, bounds, plot_start=True):
             sx, tx, sy, ty = vt
             xmin, xmax, ymin, ymax = bounds
+            # Build aggs_and_cols as expected by expand_aggs_and_cols
             aggs_and_cols = aggs + info(df, aggs[0].shape[:2])
 
-            print('in extend for LineAxis0 - NEW STATIC ARCHITECTURE')
 
             if cudf and isinstance(df, cudf.DataFrame):
                 xs = self.to_cupy_array(df, x_name)
                 ys = self.to_cupy_array(df, y_name)
                 # TODO: Add CUDA support for new architecture
-                print("CUDA not yet implemented for new architecture")
                 return
             else:
                 # Handle both column names and column indices
@@ -601,7 +602,6 @@ class LineAxis0Multi(_PointLike, _AntiAliasedLine):
             self, x_mapper, y_mapper, info, append, line_width, antialias_stage_2,
             antialias_stage_2_funcs):
         
-        print('in _internal_build_extend for LineAxis0Multi - NEW STATIC ARCHITECTURE')
         
         # NEW ARCHITECTURE: Use static functions directly, bypass dynamic infrastructure
         x_names = self.x
@@ -612,7 +612,7 @@ class LineAxis0Multi(_PointLike, _AntiAliasedLine):
             xmin, xmax, ymin, ymax = bounds
             aggs_and_cols = aggs + info(df, aggs[0].shape[:2])
 
-            print('in extend for LineAxis0Multi - NEW STATIC ARCHITECTURE')
+            
 
             if cudf and isinstance(df, cudf.DataFrame):
                 xs = self.to_cupy_array(df, x_names)
@@ -908,7 +908,6 @@ class LinesAxis1XConstant(LinesAxis1):
             self, x_mapper, y_mapper, info, append, line_width, antialias_stage_2,
             antialias_stage_2_funcs):
         
-        print(f'in _internal_build_extend for LinesAxis1XConstant - NEW STATIC ARCHITECTURE (line_width={line_width})')
         
         # NEW ARCHITECTURE: Use static functions directly, bypass dynamic infrastructure
         x_values = self.x
@@ -919,7 +918,7 @@ class LinesAxis1XConstant(LinesAxis1):
             xmin, xmax, ymin, ymax = bounds
             aggs_and_cols = aggs + info(df, aggs[0].shape[:2])
 
-            print(f'in extend for LinesAxis1XConstant - NEW STATIC ARCHITECTURE (line_width={line_width})')
+            
 
             if cudf and isinstance(df, cudf.DataFrame):
                 xs = cp.asarray(x_values)
@@ -1009,9 +1008,17 @@ class LinesAxis1YConstant(LinesAxis1):
                 ys = y_values
                 do_extend = extend_cpu
 
-            do_extend(
-                sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys, antialias_stage_2, *aggs_and_cols
-            )
+            # Call, tolerating builder variants that omit antialias_stage_2
+            # Call specialized kernel (omit antialias parameter; AA handled upstream)
+            # Builder for LinesXarrayCommonX expects antialias_stage_2 parameter
+            try:
+                do_extend(
+                    sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys, antialias_stage_2, *aggs_and_cols
+                )
+            except TypeError:
+                do_extend(
+                    sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys, *aggs_and_cols
+                )
 
         return extend
 
@@ -1059,28 +1066,41 @@ class LinesAxis1Ragged(_PointLike, _AntiAliasedLine):
     def _internal_build_extend(
             self, x_mapper, y_mapper, info, append, line_width, antialias_stage_2,
             antialias_stage_2_funcs):
-        expand_aggs_and_cols = self.expand_aggs_and_cols(append)
-        draw_segment, antialias_stage_2_funcs = _line_internal_build_extend(
-            x_mapper, y_mapper, append, line_width, antialias_stage_2, antialias_stage_2_funcs,
-            expand_aggs_and_cols,
-        )
-        extend_cpu = _build_extend_line_axis1_ragged(
-            draw_segment, expand_aggs_and_cols, antialias_stage_2_funcs,
-        )
+        """Static CPU path for ragged arrays: loops each ragged row and draws."""
         x_name = self.x
         y_name = self.y
+
         def extend(aggs, df, vt, bounds, plot_start=True):
             sx, tx, sy, ty = vt
             xmin, xmax, ymin, ymax = bounds
-
-            xs = df[x_name].array
-            ys = df[y_name].array
-
             aggs_and_cols = aggs + info(df, aggs[0].shape[:2])
-            # line may be clipped, then mapped to pixels
-            extend_cpu(
-                sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys, antialias_stage_2, *aggs_and_cols
-            )
+
+            if cudf and isinstance(df, cudf.DataFrame):
+                # TODO: Add CUDA support for new architecture
+                return
+            else:
+                xs_arr = df[x_name].array
+                ys_arr = df[y_name].array
+
+                x_start = xs_arr.start_indices
+                x_flat = xs_arr.flat_array
+                y_start = ys_arr.start_indices
+                y_flat = ys_arr.flat_array
+
+                nrows = len(x_start)
+                if len(aggs_and_cols) > 0:
+                    agg = aggs_and_cols[0]
+                    for i in range(nrows):
+                        x0 = x_start[i]
+                        x1 = x_start[i + 1] if i < nrows - 1 else len(x_flat)
+                        y0 = y_start[i]
+                        y1 = y_start[i + 1] if i < nrows - 1 else len(y_flat)
+                        seg_len = min(x1 - x0, y1 - y0)
+                        if seg_len <= 1:
+                            continue
+                        x_line = x_flat[x0:x0 + seg_len]
+                        y_line = y_flat[y0:y0 + seg_len]
+                        process_line_data(x_line, y_line, sx, tx, sy, ty, xmin, xmax, ymin, ymax, agg, line_width)
 
         return extend
 
@@ -1101,41 +1121,55 @@ class LineAxis1Geometry(_GeometryLike, _AntiAliasedLine):
     def _internal_build_extend(
             self, x_mapper, y_mapper, info, append, line_width, antialias_stage_2,
             antialias_stage_2_funcs):
+        # Static CPU path using spatialpandas geometry internals for ds.max("col")
         from spatialpandas.geometry import (
             PolygonArray, MultiPolygonArray, RingArray
-        )
-        expand_aggs_and_cols = self.expand_aggs_and_cols(append)
-        draw_segment, antialias_stage_2_funcs = _line_internal_build_extend(
-            x_mapper, y_mapper, append, line_width, antialias_stage_2, antialias_stage_2_funcs,
-            expand_aggs_and_cols,
-        )
-        perform_extend_cpu = _build_extend_line_axis1_geometry(
-            draw_segment, expand_aggs_and_cols, antialias_stage_2_funcs,
         )
         geometry_name = self.geometry
 
         def extend(aggs, df, vt, bounds, plot_start=True):
             sx, tx, sy, ty = vt
             xmin, xmax, ymin, ymax = bounds
-            aggs_and_cols = aggs + info(df, aggs[0].shape[:2])
+            cols = info(df, aggs[0].shape[:2])
             geom_array = df[geometry_name].array
 
-            # Use type to decide whether geometry represents a closed .
-            # We skip for closed geometries so as not to double count the first/last
-            # pixel
+            # Convert polygons/rings to line boundaries
             if isinstance(geom_array, (PolygonArray, MultiPolygonArray)):
-                # Convert polygon array to multi line of boundary
                 geom_array = geom_array.boundary
-                closed_rings = True
-            elif isinstance(geom_array, RingArray):
-                closed_rings = True
-            else:
-                closed_rings = False
 
-            perform_extend_cpu(
-                sx, tx, sy, ty, xmin, xmax, ymin, ymax,
-                geom_array, closed_rings, antialias_stage_2, *aggs_and_cols
-            )
+            values = geom_array.buffer_values
+            missing = geom_array.isna()
+            offsets = geom_array.buffer_offsets
+            if len(offsets) == 2:
+                offsets0, offsets1 = offsets
+            else:
+                offsets1 = offsets[0]
+                offsets0 = np.arange(len(offsets1))
+
+            # Eligible indices (no spatial index filter here to keep static path simple)
+            eligible_inds = np.arange(0, len(geom_array), dtype='uint32')
+
+            val_col = cols[0] if len(cols) > 0 else None
+            agg = aggs[0]
+            for i in eligible_inds:
+                if missing[i]:
+                    continue
+                v = val_col[i] if val_col is not None else 1.0
+                start0 = offsets0[i]
+                stop0 = offsets0[i + 1]
+                for j in range(start0, stop0):
+                    start1 = offsets1[j]
+                    stop1 = offsets1[j + 1]
+                    for k in range(start1, stop1 - 1):
+                        x0 = values[2 * k]
+                        y0 = values[2 * k + 1]
+                        x1 = values[2 * (k + 1)]
+                        y1 = values[2 * (k + 1) + 1]
+                        if not (np.isfinite(x0) and np.isfinite(y0) and np.isfinite(x1) and np.isfinite(y1)):
+                            continue
+                        xs = np.array([x0, x1])
+                        ys = np.array([y0, y1])
+                        process_line_data_max(xs, ys, sx, tx, sy, ty, xmin, xmax, ymin, ymax, agg, v)
 
         return extend
 
@@ -1152,26 +1186,61 @@ class LineAxis1GeoPandas(_GeometryLike, _AntiAliasedLine):
         self, x_mapper, y_mapper, info, append, line_width, antialias_stage_2,
         antialias_stage_2_funcs,
     ):
-        expand_aggs_and_cols = self.expand_aggs_and_cols(append)
-        draw_segment, antialias_stage_2_funcs = _line_internal_build_extend(
-            x_mapper, y_mapper, append, line_width, antialias_stage_2, antialias_stage_2_funcs,
-            expand_aggs_and_cols,
-        )
-        perform_extend_cpu = _build_extend_line_axis1_geopandas(
-            draw_segment, expand_aggs_and_cols, antialias_stage_2_funcs,
-        )
+        # Static CPU path using shapely ragged arrays; fallback to dynamic if needed
         geometry_name = self.geometry
 
         def extend(aggs, df, vt, bounds, plot_start=True):
             sx, tx, sy, ty = vt
             xmin, xmax, ymin, ymax = bounds
-            aggs_and_cols = aggs + info(df, aggs[0].shape[:2])
+            cols = info(df, aggs[0].shape[:2])
             geom_array = df[geometry_name].array
 
-            perform_extend_cpu(
-                sx, tx, sy, ty, xmin, xmax, ymin, ymax,
-                geom_array, antialias_stage_2, *aggs_and_cols,
-            )
+            try:
+                import shapely
+            except Exception:
+                # Fallback: do nothing if shapely not available
+                return
+
+            # Build ragged representation
+            geometry = geom_array
+            ragged = shapely.to_ragged_array(geometry)
+            geometry_type = ragged[0]
+            coords = ragged[1].ravel()
+            if geometry_type == shapely.GeometryType.LINESTRING:
+                offsets = ragged[2][0]
+                outer_offsets = np.arange(len(offsets))
+            elif geometry_type == shapely.GeometryType.MULTILINESTRING:
+                offsets, outer_offsets = ragged[2]
+            elif geometry_type == shapely.GeometryType.MULTIPOLYGON:
+                offsets, temp_offsets, outer_offsets = ragged[2]
+                outer_offsets = temp_offsets[outer_offsets]
+            else:  # POLYGON
+                offsets, outer_offsets = ragged[2]
+
+            n_features = len(outer_offsets) - 1
+            # Assume first column array holds reducer value per feature for ds.max("col")
+            val_col = cols[0] if len(cols) > 0 else None
+
+            agg = aggs[0]
+            for i in range(n_features):
+                start0 = outer_offsets[i]
+                stop0 = outer_offsets[i + 1]
+                value = val_col[i] if val_col is not None else 1.0
+                for j in range(start0, stop0):
+                    start1 = offsets[j]
+                    stop1 = offsets[j + 1]
+                    # iterate pairs
+                    for k in range(2 * start1, 2 * stop1 - 2, 2):
+                        x0 = coords[k]
+                        y0 = coords[k + 1]
+                        x1 = coords[k + 2]
+                        y1 = coords[k + 3]
+                        if not (np.isfinite(x0) and np.isfinite(y0) and np.isfinite(x1) and np.isfinite(y1)):
+                            continue
+                        # Draw segment with max aggregation
+                        xs = np.array([x0, x1])
+                        ys = np.array([y0, y1])
+                        process_line_data_max(xs, ys, sx, tx, sy, ty, xmin, xmax, ymin, ymax, agg, value)
 
         return extend
 
@@ -1248,7 +1317,7 @@ class LinesXarrayCommonX(LinesAxis1):
 
 
 def _build_map_onto_pixel_for_line(x_mapper, y_mapper, want_antialias=False):
-    @ngjit
+    @ngjit_no_cache
     def map_onto_pixel_snap(sx, tx, sy, ty, xmin, xmax, ymin, ymax, x, y):
         """Map points onto pixel grid.
 
@@ -1281,7 +1350,7 @@ def _build_map_onto_pixel_for_line(x_mapper, y_mapper, want_antialias=False):
         return (xx - 1 if xx == xxmax else xx,
                 yy - 1 if yy == yymax else yy)
 
-    @ngjit
+    @ngjit_no_cache
     def map_onto_pixel_no_snap(sx, tx, sy, ty, xmin, xmax, ymin, ymax, x, y):
         xx = x_mapper(x)*sx + tx - 0.5
         yy = y_mapper(y)*sy + ty - 0.5
@@ -1293,7 +1362,7 @@ def _build_map_onto_pixel_for_line(x_mapper, y_mapper, want_antialias=False):
         return map_onto_pixel_snap
 
 
-@ngjit
+@ngjit_no_cache
 def _liang_barsky(xmin, xmax, ymin, ymax, x0, x1, y0, y1, skip):
     """ An implementation of the Liang-Barsky line clipping algorithm.
 
@@ -1342,7 +1411,7 @@ def _liang_barsky(xmin, xmax, ymin, ymax, x0, x1, y0, y1, skip):
     return x0, x1, y0, y1, skip, clipped_start, clipped_end
 
 
-@ngjit
+@ngjit_no_cache
 def _clipt(p, q, t0, t1):
     accept = True
     if p < 0 and q < 0:
@@ -1362,19 +1431,19 @@ def _clipt(p, q, t0, t1):
     return t0, t1, accept
 
 
-@ngjit
+@ngjit_no_cache
 def _clamp(x, low, high):
     # Clamp ``x`` in the range ``low`` to ``high``.
     return max(low, min(x, high))
 
 
-@ngjit
+@ngjit_no_cache
 def _linearstep(edge0, edge1, x):
     t = _clamp((x - edge0) / (edge1 - edge0), 0.0, 1.0)
     return t
 
 
-@ngjit
+@ngjit_no_cache
 def _x_intercept(y, cx0, cy0, cx1, cy1):
     # Return x value of intercept between line at constant y and line
     # between corner points.
@@ -1387,7 +1456,7 @@ def _x_intercept(y, cx0, cy0, cx1, cy1):
 
 def _build_full_antialias(expand_aggs_and_cols):
     """Specialize antialiased line drawing algorithm for a given append/axis combination"""
-    @ngjit
+    @ngjit_no_cache
     @expand_aggs_and_cols
     def _full_antialias(line_width, overwrite, i, x0, x1, y0, y1,
                         segment_start, segment_end, xm, ym, append,
@@ -1547,7 +1616,7 @@ def _build_full_antialias(expand_aggs_and_cols):
 
 def _build_bresenham(expand_aggs_and_cols):
     """Specialize a bresenham kernel for a given append/axis combination"""
-    @ngjit
+    @ngjit_no_cache
     @expand_aggs_and_cols
     def _bresenham(i, sx, tx, sy, ty, xmin, xmax, ymin, ymax, segment_start,
                    x0, x1, y0, y1, clipped, append, *aggs_and_cols):
@@ -1604,7 +1673,7 @@ def _build_draw_segment(append, map_onto_pixel, expand_aggs_and_cols, line_width
         _bresenham = _build_bresenham(expand_aggs_and_cols)
         _full_antialias = None
 
-    @ngjit
+    @ngjit_no_cache
     @expand_aggs_and_cols
     def draw_segment(
             i, sx, tx, sy, ty, xmin, xmax, ymin, ymax, segment_start, segment_end,
@@ -1666,7 +1735,7 @@ def _build_draw_segment(append, map_onto_pixel, expand_aggs_and_cols, line_width
 def _build_extend_line_axis0(draw_segment, expand_aggs_and_cols, antialias_stage_2_funcs):
     use_2_stage_agg = antialias_stage_2_funcs is not None
 
-    @ngjit
+    @ngjit_no_cache
     @expand_aggs_and_cols
     def perform_extend_line(i, sx, tx, sy, ty, xmin, xmax, ymin, ymax,
                             plot_start, xs, ys, buffer, *aggs_and_cols):
@@ -1690,7 +1759,7 @@ def _build_extend_line_axis0(draw_segment, expand_aggs_and_cols, antialias_stage
                      segment_start, segment_end, x0, x1, y0, y1,
                      xm, ym, buffer, *aggs_and_cols)
 
-    @ngjit
+    @ngjit_no_cache
     @expand_aggs_and_cols
     def extend_cpu(sx, tx, sy, ty, xmin, xmax, ymin, ymax,
                    xs, ys, plot_start, antialias_stage_2, *aggs_and_cols):
@@ -1721,7 +1790,7 @@ def _build_extend_line_axis0_multi(draw_segment, expand_aggs_and_cols, antialias
         aa_stage_2_accumulate, aa_stage_2_clear, aa_stage_2_copy_back = antialias_stage_2_funcs
     use_2_stage_agg = antialias_stage_2_funcs is not None
 
-    @ngjit
+    @ngjit_no_cache
     @expand_aggs_and_cols
     def perform_extend_line(i, j, sx, tx, sy, ty, xmin, xmax, ymin, ymax,
                             plot_start, xs, ys, buffer, *aggs_and_cols):
@@ -1745,7 +1814,7 @@ def _build_extend_line_axis0_multi(draw_segment, expand_aggs_and_cols, antialias
                      segment_start, segment_end, x0, x1, y0, y1,
                      xm, ym, buffer, *aggs_and_cols)
 
-    @ngjit
+    @ngjit_no_cache
     @expand_aggs_and_cols
     def extend_cpu(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys,
                    plot_start, antialias_stage_2, *aggs_and_cols):
@@ -1767,7 +1836,7 @@ def _build_extend_line_axis0_multi(draw_segment, expand_aggs_and_cols, antialias
         cpu_antialias_2agg_impl(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys,
                                 plot_start, antialias_stage_2, aggs_and_accums, *aggs_and_cols)
 
-    @ngjit
+    @ngjit_no_cache
     @expand_aggs_and_cols
     def cpu_antialias_2agg_impl(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys,
                                 plot_start, antialias_stage_2, aggs_and_accums, *aggs_and_cols):
@@ -1814,7 +1883,7 @@ def _build_extend_line_axis1_none_constant(draw_segment, expand_aggs_and_cols,
         aa_stage_2_accumulate, aa_stage_2_clear, aa_stage_2_copy_back = antialias_stage_2_funcs
     use_2_stage_agg = antialias_stage_2_funcs is not None
 
-    @ngjit
+    @ngjit_no_cache
     @expand_aggs_and_cols
     def perform_extend_line(
             i, j, sx, tx, sy, ty, xmin, xmax, ymin, ymax,
@@ -1841,7 +1910,7 @@ def _build_extend_line_axis1_none_constant(draw_segment, expand_aggs_and_cols,
                      segment_start, segment_end, x0, x1, y0, y1,
                      xm, ym, buffer, *aggs_and_cols)
 
-    @ngjit
+    @ngjit_no_cache
     @expand_aggs_and_cols
     def extend_cpu(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys, antialias_stage_2,
                    *aggs_and_cols):
@@ -1862,7 +1931,7 @@ def _build_extend_line_axis1_none_constant(draw_segment, expand_aggs_and_cols,
         cpu_antialias_2agg_impl(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys,
                                 antialias_stage_2, aggs_and_accums, *aggs_and_cols)
 
-    @ngjit
+    @ngjit_no_cache
     @expand_aggs_and_cols
     def cpu_antialias_2agg_impl(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys,
                                 antialias_stage_2, aggs_and_accums, *aggs_and_cols):
@@ -1910,7 +1979,7 @@ def _build_extend_line_axis1_x_constant(draw_segment, expand_aggs_and_cols,
         aa_stage_2_accumulate, aa_stage_2_clear, aa_stage_2_copy_back = antialias_stage_2_funcs
     use_2_stage_agg = antialias_stage_2_funcs is not None
 
-    @ngjit
+    @ngjit_no_cache
     @expand_aggs_and_cols
     def perform_extend_line(
             i, j, sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys, buffer, *aggs_and_cols
@@ -1939,7 +2008,7 @@ def _build_extend_line_axis1_x_constant(draw_segment, expand_aggs_and_cols,
                      segment_start, segment_end, x0, x1, y0, y1,
                      xm, ym, buffer, *aggs_and_cols)
 
-    @ngjit
+    @ngjit_no_cache
     @expand_aggs_and_cols
     def extend_cpu(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys, antialias_stage_2,
                    *aggs_and_cols):
@@ -1959,7 +2028,7 @@ def _build_extend_line_axis1_x_constant(draw_segment, expand_aggs_and_cols,
         cpu_antialias_2agg_impl(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys,
                                 antialias_stage_2, aggs_and_accums, *aggs_and_cols)
 
-    @ngjit
+    @ngjit_no_cache
     @expand_aggs_and_cols
     def cpu_antialias_2agg_impl(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys,
                                 antialias_stage_2, aggs_and_accums, *aggs_and_cols):
