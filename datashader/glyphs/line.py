@@ -1,7 +1,6 @@
 from __future__ import annotations
 import math
 import numpy as np
-from toolz import memoize
 
 # NOTE: This import must be early to ensure Numba cache dir and precise caching is initialized
 import datashader.cre_numba_init  # initialize precise Numba caching and cache dirs
@@ -486,7 +485,6 @@ class LineAxis0(_PointLike, _AntiAliasedLine):
         else:
             bounds = self._compute_bounds(df[self.y])
         return self.maybe_expand_bounds(bounds)
-    @memoize
     def _internal_build_extend(
             self, x_mapper, y_mapper, info, append, line_width, antialias_stage_2,
             antialias_stage_2_funcs):
@@ -581,7 +579,6 @@ class LineAxis0Multi(_PointLike, _AntiAliasedLine):
         mins, maxes = zip(*bounds_list)
         return self.maybe_expand_bounds((min(mins), max(maxes)))
 
-    @memoize
     def compute_bounds_dask(self, ddf):
 
         r = ddf.map_partitions(lambda df: np.array([[
@@ -597,7 +594,6 @@ class LineAxis0Multi(_PointLike, _AntiAliasedLine):
         return (self.maybe_expand_bounds(x_extents),
                 self.maybe_expand_bounds(y_extents))
 
-    @memoize
     def _internal_build_extend(
             self, x_mapper, y_mapper, info, append, line_width, antialias_stage_2,
             antialias_stage_2_funcs):
@@ -740,7 +736,6 @@ class LinesAxis1(_PointLike, _AntiAliasedLine):
 
         return self.maybe_expand_bounds((min(mins), max(maxes)))
 
-    @memoize
     def compute_bounds_dask(self, ddf):
 
         r = ddf.map_partitions(lambda df: np.array([[
@@ -756,7 +751,6 @@ class LinesAxis1(_PointLike, _AntiAliasedLine):
         return (self.maybe_expand_bounds(x_extents),
                 self.maybe_expand_bounds(y_extents))
 
-    @memoize
     def _internal_build_extend(
             self, x_mapper, y_mapper, info, append, line_width, antialias_stage_2,
             antialias_stage_2_funcs):
@@ -890,7 +884,6 @@ class LinesAxis1XConstant(LinesAxis1):
         x_max = np.nanmax(self.x)
         return self.maybe_expand_bounds((x_min, x_max))
 
-    @memoize
     def compute_bounds_dask(self, ddf):
 
         r = ddf.map_partitions(lambda df: np.array([[
@@ -903,7 +896,6 @@ class LinesAxis1XConstant(LinesAxis1):
         return (self.compute_x_bounds(),
                 self.maybe_expand_bounds(y_extents))
 
-    @memoize
     def _internal_build_extend(
             self, x_mapper, y_mapper, info, append, line_width, antialias_stage_2,
             antialias_stage_2_funcs):
@@ -965,7 +957,6 @@ class LinesAxis1YConstant(LinesAxis1):
         y_max = np.nanmax(self.y)
         return self.maybe_expand_bounds((y_min, y_max))
 
-    @memoize
     def compute_bounds_dask(self, ddf):
 
         r = ddf.map_partitions(lambda df: np.array([[
@@ -978,7 +969,6 @@ class LinesAxis1YConstant(LinesAxis1):
         return (self.maybe_expand_bounds(x_extents),
                 self.compute_y_bounds())
 
-    @memoize
     def _internal_build_extend(
             self, x_mapper, y_mapper, info, append, line_width, antialias_stage_2,
             antialias_stage_2_funcs):
@@ -1046,7 +1036,6 @@ class LinesAxis1Ragged(_PointLike, _AntiAliasedLine):
         bounds = self._compute_bounds(df[self.y].array.flat_array)
         return self.maybe_expand_bounds(bounds)
 
-    @memoize
     def compute_bounds_dask(self, ddf):
 
         r = ddf.map_partitions(lambda df: np.array([[
@@ -1062,7 +1051,6 @@ class LinesAxis1Ragged(_PointLike, _AntiAliasedLine):
         return (self.maybe_expand_bounds(x_extents),
                 self.maybe_expand_bounds(y_extents))
 
-    @memoize
     def _internal_build_extend(
             self, x_mapper, y_mapper, info, append, line_width, antialias_stage_2,
             antialias_stage_2_funcs):
@@ -1117,7 +1105,6 @@ class LineAxis1Geometry(_GeometryLike, _AntiAliasedLine):
         return (LineDtype, MultiLineDtype, RingDtype,
                 PolygonDtype, MultiPolygonDtype)
 
-    @memoize
     def _internal_build_extend(
             self, x_mapper, y_mapper, info, append, line_width, antialias_stage_2,
             antialias_stage_2_funcs):
@@ -1181,7 +1168,6 @@ class LineAxis1GeoPandas(_GeometryLike, _AntiAliasedLine):
         from geopandas.array import GeometryDtype
         return (GeometryDtype,)
 
-    @memoize
     def _internal_build_extend(
         self, x_mapper, y_mapper, info, append, line_width, antialias_stage_2,
         antialias_stage_2_funcs,
@@ -1272,7 +1258,6 @@ class LinesXarrayCommonX(LinesAxis1):
         if not isreal(in_dshape.measure[str(self.y)]):
             raise ValueError('y column must be real')
 
-    @memoize
     def _internal_build_extend(
         self, x_mapper, y_mapper, info, append, line_width, antialias_stage_2,
         antialias_stage_2_funcs,
