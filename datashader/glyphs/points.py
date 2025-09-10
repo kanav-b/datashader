@@ -79,6 +79,25 @@ def process_points_data(xs, ys, sx, tx, sy, ty, xmin, xmax, ymin, ymax, agg):
         y = ys[i]  # Pass through without type conversion for stable cache keys
         draw_point(x, y, sx, tx, sy, ty, xmin, xmax, ymin, ymax, agg)
 
+@njit(cache=True)
+def process_points_data_masked(xs, ys, mask, sx, tx, sy, ty, xmin, xmax, ymin, ymax, agg):
+    """Like process_points_data, but only counts points where mask[i] is True.
+
+    Used to implement column-aware reducers like ds.count('col') that should
+    ignore nulls in the specified column.
+    """
+    # Initialize agg if NaN
+    if agg.flat[0] != agg.flat[0]:
+        agg.fill(0.0)
+
+    n = len(xs)
+    for i in range(n):
+        if not mask[i]:
+            continue
+        x = xs[i]
+        y = ys[i]
+        draw_point(x, y, sx, tx, sy, ty, xmin, xmax, ymin, ymax, agg)
+
 
 def values(s):
     if isinstance(s, cudf.Series):
@@ -267,7 +286,10 @@ class Point(_PointLike):
         def extend(aggs, df, vt, bounds):
             sx, tx, sy, ty = vt
             xmin, xmax, ymin, ymax = bounds
-            aggs_and_cols = aggs + info(df, aggs[0].shape[:2])
+            # Collect reducer columns separately so we can build masks for
+            # column-aware reducers like ds.count('col').
+            cols = info(df, aggs[0].shape[:2])
+            aggs_and_cols = aggs + cols
 
             print('in extend for Point - NEW STATIC ARCHITECTURE')
 
@@ -288,12 +310,27 @@ class Point(_PointLike):
                     ys = df.iloc[:, y_name].values
                 else:
                     ys = df[y_name].values
-                
-                # NEW ARCHITECTURE: Call static function directly for each point
+                # NEW ARCHITECTURE: Call static function; if a single
+                # reducer column is present (e.g., ds.count('col')), build
+                # a non-null mask so counts ignore nulls in that column.
                 if len(aggs_and_cols) > 0:
                     agg = aggs_and_cols[0]
-                    # Process all points with the static function
-                    process_points_data(xs, ys, sx, tx, sy, ty, xmin, xmax, ymin, ymax, agg)
+                    used_mask = False
+                    if cols:
+                        # For simple single-reducer cases, cols[0] holds
+                        # the specified column values.
+                        col0 = cols[0]
+                        try:
+                            # Build mask: True where value is not NaN
+                            mask = ~np.isnan(col0.astype('float64'))
+                            used_mask = True
+                        except Exception:
+                            # Fallback: no mask if dtype cannot be cast or isnan not applicable
+                            used_mask = False
+                    if used_mask:
+                        process_points_data_masked(xs, ys, mask, sx, tx, sy, ty, xmin, xmax, ymin, ymax, agg)
+                    else:
+                        process_points_data(xs, ys, sx, tx, sy, ty, xmin, xmax, ymin, ymax, agg)
 
         return extend
 
