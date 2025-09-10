@@ -15,7 +15,7 @@ from datashader.colors import rgb, Sets1to3
 from datashader.utils import nansum_missing, ngjit, uint32_to_uint8
 
 # NOTE: This import must be early to ensure Numba cache dir and precise caching is initialized
-import datashader.cre_numba_init  # initialize precise Numba caching and cache dirs
+# NOTE: Numba caching is now handled inline in line.py
 
 from numba import njit
 

@@ -3,8 +3,107 @@ import math
 import numpy as np
 from toolz import memoize
 
-# NOTE: This import must be early to ensure Numba cache dir and precise caching is initialized
-import datashader.cre_numba_init  # initialize precise Numba caching and cache dirs
+# Inline CRE cache functionality from cre_cache.py
+import hashlib
+import os
+
+# Configure Numba to use __pycache__ directory BEFORE importing numba
+# This will make all Numba caches go to __pycache__ instead of ~/.numba_cache
+if not os.environ.get('NUMBA_CACHE_DIR'):
+    # Set cache directory to current working directory + __pycache__
+    cache_dir = os.path.join(os.getcwd(), '__pycache__')
+    os.environ['NUMBA_CACHE_DIR'] = cache_dir
+
+from numba.core.caching import Cache, _UserProvidedCacheLocator, CompileResultCacheImpl
+from numba.core.serialize import dumps
+from numba.core.dispatcher import Dispatcher
+from numba.extending import _Intrinsic
+
+# Also set the Numba configuration directly
+import numba
+numba.config.CACHE_DIR = os.environ.get('NUMBA_CACHE_DIR', '')
+
+
+class _PreciseCacheLocator(_UserProvidedCacheLocator):
+    """Cache locator hashing function bytecode and referenced globals."""
+
+    def __init__(self, py_func, py_file):
+        super().__init__(py_func, py_file)
+        self._py_func = py_func
+
+        code = py_func.__code__
+        glbs = py_func.__globals__
+
+        used_globals = {}
+        for k in code.co_names:
+            if k not in glbs:
+                continue
+            v = glbs[k]
+            if isinstance(v, _Intrinsic):
+                v_code = v._defn.__code__.co_code
+                used_globals[k] = v_code
+            elif isinstance(v, Dispatcher):
+                v_code = v.py_func.__code__.co_code
+                used_globals[k] = v_code
+            else:
+                try:
+                    # Ensure the global is picklable, otherwise skip it to
+                    # avoid failures during caching (e.g. builtins.input in
+                    # interactive environments)
+                    dumps(v)
+                except Exception:
+                    continue
+                used_globals[k] = v
+
+        func_bytes = code.co_code + dumps(used_globals)
+        self._func_hash = hashlib.sha256(func_bytes).hexdigest()
+
+    def get_source_stamp(self):
+        return self._func_hash
+
+    def get_disambiguator(self):
+        return self._func_hash[:10]
+
+    @classmethod
+    def get_suitable_cache_subpath(cls, py_file):
+        """Override to use __pycache__ directory instead of separate cache dir."""
+        import os
+        import hashlib
+        
+        # Get the directory containing the Python file
+        py_dir = os.path.dirname(os.path.abspath(py_file))
+        
+        # Create __pycache__ subdirectory with hash for uniqueness
+        # Use SHA1 to reduce path length (following Numba's pattern)
+        hashed = hashlib.sha1(py_dir.encode()).hexdigest()
+        
+        # Return path that will be joined with CACHE_DIR
+        # If CACHE_DIR is empty, this will create: __pycache__/datashader_{hash}
+        return f"__pycache__/datashader_{hashed}"
+
+    @classmethod
+    def from_function(cls, py_func, py_file):
+        return cls(py_func, py_file)
+
+
+class PreciseCacheImpl(CompileResultCacheImpl):
+    _locator_classes = [_PreciseCacheLocator, *CompileResultCacheImpl._locator_classes]
+
+
+class PreciseCache(Cache):
+    """Cache that saves and loads CompileResult objects using precise hashing."""
+
+    _impl_class = PreciseCacheImpl
+
+
+def enable_precise_caching(self):
+    """Enable caching using :class:`PreciseCache` on a Dispatcher."""
+
+    self._cache = PreciseCache(self.py_func)
+
+
+# Expose method on Dispatcher
+Dispatcher.enable_precise_caching = enable_precise_caching
 
 # --- COMPLETELY NEW ARCHITECTURE: Simple, Static, Cacheable Functions ---
 from numba import njit
@@ -351,79 +450,13 @@ def _line_internal_build_extend(
     return draw_segment, antialias_stage_2_funcs
 
 
-# --- Caching helper for draw_segment ---
+# --- Simplified draw_segment function ---
 def _build_draw_segment(append, map_onto_pixel, expand_aggs_and_cols, line_width, overwrite):
     """
-    Build and cache the draw_segment function using disk-based caching.
-    This version ensures append and map_onto_pixel come from cached sources.
+    Build the draw_segment function with simplified caching.
     """
-    from datashader.cre_cache_helpers import (
-        unique_hash,
-        source_to_cache,
-        import_from_cached,
-    )
-    import inspect
-
-    # Compute cache hash for draw_segment
-    cache_hash = unique_hash([
-        getattr(append, "__name__", "append"),
-        getattr(map_onto_pixel, "__name__", "map_onto_pixel"),
-        line_width,
-        overwrite,
-    ])
-    cache_name = "draw_segment"
-
-    # Try to load from cache
-    try:
-        cached = import_from_cached(cache_name, cache_hash, ["draw_segment"])
-        return cached["draw_segment"]
-    except Exception:
-        pass
-
-    # --- Prepare cached imports for append and map_onto_pixel ---
-    append_hash = unique_hash([getattr(append, "__name__", "append")])
-    map_hash = unique_hash([getattr(map_onto_pixel, "__name__", "map_onto_pixel")])
-
-    # Inline helper function sources
-    from datashader.glyphs.line import _liang_barsky, _linearstep, _clamp
-    clamp_src = inspect.getsource(_clamp)
-    linearstep_src = inspect.getsource(_linearstep)
-    liang_barsky_src = inspect.getsource(_liang_barsky)
-
-    # Build the function source string - FIXED: Use .format() instead of f-string for template variables
-    fn_src = """
-from numba import njit
-import numpy as np
-from datashader.cre_cache_helpers import import_from_cached
-
-# Pull cached versions of dependencies
-append = import_from_cached("append", "{append_hash}", ["append"])["append"]
-map_onto_pixel = import_from_cached("map_onto_pixel", "{map_hash}", ["map_onto_pixel"])["map_onto_pixel"]
-
-{clamp_src}
-{linearstep_src}
-{liang_barsky_src}
-
-@njit(cache=True)
-def draw_segment(*args, **kwargs):
-    raise NotImplementedError("draw_segment not implemented in cache stub.")
-""".format(
-        append_hash=append_hash,
-        map_hash=map_hash,
-        clamp_src=clamp_src,
-        linearstep_src=linearstep_src,
-        liang_barsky_src=liang_barsky_src
-    )
-
-    # Write to cache
-    source_to_cache(cache_name, cache_hash, fn_src)
-
-    # Import from cache and return
-    cached = import_from_cached(cache_name, cache_hash, ["draw_segment"])
-
-    print(append.__name__, map_onto_pixel.__name__, "draw_segment cached with hash", cache_hash)
-
-    return cached["draw_segment"]
+    # Use the existing draw_line_segment function directly
+    return draw_line_segment
 
 
 class LineAxis0(_PointLike, _AntiAliasedLine):

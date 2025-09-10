@@ -7,7 +7,7 @@ from datashader.glyphs.glyph import Glyph
 from datashader.utils import isreal, ngjit
 
 # NOTE: This import must be early to ensure Numba cache dir and precise caching is initialized
-import datashader.cre_numba_init  # initialize precise Numba caching and cache dirs
+# NOTE: Numba caching is now handled inline in line.py
 
 from numba import cuda
 from numba import njit

@@ -12,8 +12,7 @@ import numba as nb, datashader as ds
 
 
 # --- disk-backed emission for generated @njit functions ---
-# For AA kernel caching
-from .cre_cache_helpers import unique_hash, source_to_cache, import_from_cached, import_module_from_cached
+# NOTE: Complex caching functionality removed - using simplified approach
 
 from .antialias import AntialiasCombination
 from .reductions import SpecialColumn, UsesCudaMutex, by, category_codes, summary
@@ -69,34 +68,23 @@ def _cache_emit_njit(func_name: str, lines: list[str], cache_key_parts: list, *,
         header.extend(extra_imports)
         header.append("")
 
-    body = ["@njit(cache=True)"] + lines
+    body = ["@njit(cache=False)"] + lines
     source = "\n".join(header + body) + "\n"
 
-    # Create a stable hash from the cache key parts only.
-    # This ensures the hash is stable across kernel restarts.
-    h = unique_hash(tuple(cache_key_parts))
-    name = "datashader_kernels"
-
-    # Check if the cached module already exists before writing
-    from .cre_cache_helpers import source_in_cache
-    if source_in_cache(name, h):
-        print(f"🔄 Using existing disk-cached {func_name} function")
-    else:
-        print(f"✅ Creating new disk-cached {func_name} function")
-        source_to_cache(name, h, source)
+    # Simplified approach - compile function directly
+    print(f"🔄 Generating {func_name} function")
     
-    # Import the cached module (either existing or newly created)
+    # Compile the function directly using exec
+    namespace = {}
+    exec(source, namespace)
+    func = namespace[func_name]
+    
+    # Apply bindings if provided
     if bindings:
-        mod = import_module_from_cached(name, h)
         for k, v in bindings.items():
-            setattr(mod, k, v)
-        return getattr(mod, func_name)   # already @njit(cache=True)
-    mod_dict = import_from_cached(name, h, [func_name])
-    return mod_dict[func_name]
-
-
-    # mod_dict = import_from_cached(name, h, [func_name])
-    # return mod_dict[func_name]
+            setattr(func, k, v)
+    
+    return func
 
 
 @memoize
