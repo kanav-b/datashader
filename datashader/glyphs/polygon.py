@@ -1,4 +1,3 @@
-from toolz import memoize
 import numpy as np
 
 from datashader.glyphs.line import _build_map_onto_pixel_for_line
@@ -17,7 +16,6 @@ class GeopandasPolygonGeom(_GeometryLike):
         from geopandas.array import GeometryDtype
         return (GeometryDtype,)
 
-    @memoize
     def _build_extend(self, x_mapper, y_mapper, info, append, _antialias_stage_2,
                       _antialias_stage_2_funcs):
         expand_aggs_and_cols = self.expand_aggs_and_cols(append)
@@ -54,7 +52,6 @@ class PolygonGeom(_GeometryLike):
         from spatialpandas.geometry import PolygonDtype, MultiPolygonDtype
         return PolygonDtype, MultiPolygonDtype
 
-    @memoize
     def _build_extend(self, x_mapper, y_mapper, info, append, _antialias_stage_2,
                       _antialias_stage_2_funcs):
         expand_aggs_and_cols = self.expand_aggs_and_cols(append)

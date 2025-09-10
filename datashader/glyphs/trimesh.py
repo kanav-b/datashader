@@ -1,7 +1,6 @@
 from __future__ import annotations
 from math import floor
 import numpy as np
-from toolz import memoize
 
 from datashader.glyphs.points import _PointLike
 from datashader.utils import isreal, ngjit
@@ -62,7 +61,6 @@ class Triangles(_PolygonLike):
     xs, ys, zs : list of str
         Column names of x, y, and (optional) z coordinates of each vertex.
     """
-    @memoize
     def _build_extend(self, x_mapper, y_mapper, info, append, _antialias_stage_2,
                       _antialias_stage_2_funcs):
         draw_triangle, draw_triangle_interp = _build_draw_triangle(append)

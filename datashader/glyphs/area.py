@@ -1,6 +1,5 @@
 from __future__ import annotations
 import numpy as np
-from toolz import memoize
 
 from datashader.glyphs.glyph import Glyph
 from datashader.glyphs.line import _build_map_onto_pixel_for_line, _clipt
@@ -78,7 +77,6 @@ class AreaToZeroAxis0(_PointLike):
         # Expand bounds if needed
         return self.maybe_expand_bounds(bounds)
 
-    @memoize
     def compute_bounds_dask(self, ddf):
 
         r = ddf.map_partitions(lambda df: np.array([[
@@ -97,7 +95,6 @@ class AreaToZeroAxis0(_PointLike):
         return (self.maybe_expand_bounds(x_extents),
                 self.maybe_expand_bounds(y_extents))
 
-    @memoize
     def _build_extend(self, x_mapper, y_mapper, info, append, _antialias_stage_2,
                       _antialias_stage_2_funcs):
         expand_aggs_and_cols = self.expand_aggs_and_cols(append)
@@ -160,7 +157,6 @@ class AreaToLineAxis0(_AreaToLineLike):
         # Expand bounds if needed
         return self.maybe_expand_bounds(bounds)
 
-    @memoize
     def compute_bounds_dask(self, ddf):
         r = ddf.map_partitions(lambda df: np.array([[
             np.nanmin(df[self.x].values).item(),
@@ -182,7 +178,6 @@ class AreaToLineAxis0(_AreaToLineLike):
         return (self.maybe_expand_bounds(x_extents),
                 self.maybe_expand_bounds(y_extents))
 
-    @memoize
     def _build_extend(self, x_mapper, y_mapper, info, append, _antialias_stage_2,
                       _antialias_stage_2_funcs):
         expand_aggs_and_cols = self.expand_aggs_and_cols(append)
@@ -256,7 +251,6 @@ class AreaToZeroAxis0Multi(_PointLike):
         mx = max(0, max(maxes))
         return self.maybe_expand_bounds((mn, mx))
 
-    @memoize
     def compute_bounds_dask(self, ddf):
 
         r = ddf.map_partitions(lambda df: np.array([[
@@ -275,7 +269,6 @@ class AreaToZeroAxis0Multi(_PointLike):
         return (self.maybe_expand_bounds(x_extents),
                 self.maybe_expand_bounds(y_extents))
 
-    @memoize
     def _build_extend(self, x_mapper, y_mapper, info, append, _antialias_stage_2,
                       _antialias_stage_2_funcs):
         expand_aggs_and_cols = self.expand_aggs_and_cols(append)
@@ -348,7 +341,6 @@ class AreaToLineAxis0Multi(_AreaToLineLike):
 
         return self.maybe_expand_bounds((min(mins), max(maxes)))
 
-    @memoize
     def compute_bounds_dask(self, ddf):
 
         r = ddf.map_partitions(lambda df: np.array([[
@@ -367,7 +359,6 @@ class AreaToLineAxis0Multi(_AreaToLineLike):
         return (self.maybe_expand_bounds(x_extents),
                 self.maybe_expand_bounds(y_extents))
 
-    @memoize
     def _build_extend(self, x_mapper, y_mapper, info, append, _antialias_stage_2,
                       _antialias_stage_2_funcs):
         expand_aggs_and_cols = self.expand_aggs_and_cols(append)
@@ -456,7 +447,6 @@ class AreaToZeroAxis1(_PointLike):
 
         return self.maybe_expand_bounds((mn, mx))
 
-    @memoize
     def compute_bounds_dask(self, ddf):
 
         r = ddf.map_partitions(lambda df: np.array([[
@@ -475,7 +465,6 @@ class AreaToZeroAxis1(_PointLike):
         return (self.maybe_expand_bounds(x_extents),
                 self.maybe_expand_bounds(y_extents))
 
-    @memoize
     def _build_extend(self, x_mapper, y_mapper, info, append, _antialias_stage_2,
                       _antialias_stage_2_funcs):
         expand_aggs_and_cols = self.expand_aggs_and_cols(append)
@@ -565,7 +554,6 @@ class AreaToLineAxis1(_AreaToLineLike):
 
         return self.maybe_expand_bounds((min(mins), max(maxes)))
 
-    @memoize
     def compute_bounds_dask(self, ddf):
 
         r = ddf.map_partitions(lambda df: np.array([[
@@ -584,7 +572,6 @@ class AreaToLineAxis1(_AreaToLineLike):
         return (self.maybe_expand_bounds(x_extents),
                 self.maybe_expand_bounds(y_extents))
 
-    @memoize
     def _build_extend(self, x_mapper, y_mapper, info, append, _antialias_stage_2,
                       _antialias_stage_2_funcs):
         expand_aggs_and_cols = self.expand_aggs_and_cols(append)
@@ -641,7 +628,6 @@ class AreaToZeroAxis1XConstant(AreaToZeroAxis1):
         x_max = np.nanmax(self.x)
         return self.maybe_expand_bounds((x_min, x_max))
 
-    @memoize
     def compute_bounds_dask(self, ddf):
 
         r = ddf.map_partitions(lambda df: np.array([[
@@ -654,7 +640,6 @@ class AreaToZeroAxis1XConstant(AreaToZeroAxis1):
         return (self.compute_x_bounds(),
                 self.maybe_expand_bounds(y_extents))
 
-    @memoize
     def _build_extend(self, x_mapper, y_mapper, info, append, _antialias_stage_2,
                       _antialias_stage_2_funcs):
         expand_aggs_and_cols = self.expand_aggs_and_cols(append)
@@ -718,7 +703,6 @@ class AreaToLineAxis1XConstant(AreaToLineAxis1):
         x_max = np.nanmax(self.x)
         return self.maybe_expand_bounds((x_min, x_max))
 
-    @memoize
     def compute_bounds_dask(self, ddf):
 
         r = ddf.map_partitions(lambda df: np.array([[
@@ -734,7 +718,6 @@ class AreaToLineAxis1XConstant(AreaToLineAxis1):
         return (self.compute_x_bounds(),
                 self.maybe_expand_bounds(y_extents))
 
-    @memoize
     def _build_extend(self, x_mapper, y_mapper, info, append, _antialias_stage_2,
                       _antialias_stage_2_funcs):
         expand_aggs_and_cols = self.expand_aggs_and_cols(append)
@@ -791,7 +774,6 @@ class AreaToZeroAxis1YConstant(AreaToZeroAxis1):
         y_max = np.nanmax(self.y)
         return self.maybe_expand_bounds((y_min, y_max))
 
-    @memoize
     def compute_bounds_dask(self, ddf):
 
         r = ddf.map_partitions(lambda df: np.array([[
@@ -804,7 +786,6 @@ class AreaToZeroAxis1YConstant(AreaToZeroAxis1):
         return (self.maybe_expand_bounds(x_extents),
                 self.compute_y_bounds())
 
-    @memoize
     def _build_extend(self, x_mapper, y_mapper, info, append, _antialias_stage_2,
                       _antialias_stage_2_funcs):
         expand_aggs_and_cols = self.expand_aggs_and_cols(append)
@@ -860,7 +841,6 @@ class AreaToLineAxis1YConstant(AreaToLineAxis1):
         y_max = max(np.nanmax(self.y), np.nanmax(self.y_stack))
         return self.maybe_expand_bounds((y_min, y_max))
 
-    @memoize
     def compute_bounds_dask(self, ddf):
 
         r = ddf.map_partitions(lambda df: np.array([[
@@ -873,7 +853,6 @@ class AreaToLineAxis1YConstant(AreaToLineAxis1):
         return (self.maybe_expand_bounds(x_extents),
                 self.compute_y_bounds())
 
-    @memoize
     def _build_extend(self, x_mapper, y_mapper, info, append, _antialias_stage_2,
                       _antialias_stage_2_funcs):
         expand_aggs_and_cols = self.expand_aggs_and_cols(append)
@@ -940,7 +919,6 @@ class AreaToZeroAxis1Ragged(_PointLike):
 
         return self.maybe_expand_bounds(bounds)
 
-    @memoize
     def compute_bounds_dask(self, ddf):
 
         r = ddf.map_partitions(lambda df: np.array([[
@@ -959,7 +937,6 @@ class AreaToZeroAxis1Ragged(_PointLike):
         return (self.maybe_expand_bounds(x_extents),
                 self.maybe_expand_bounds(y_extents))
 
-    @memoize
     def _build_extend(self, x_mapper, y_mapper, info, append, _antialias_stage_2,
                       _antialias_stage_2_funcs):
         expand_aggs_and_cols = self.expand_aggs_and_cols(append)
@@ -1021,7 +998,6 @@ class AreaToLineAxis1Ragged(_AreaToLineLike):
 
         return self.maybe_expand_bounds(bounds)
 
-    @memoize
     def compute_bounds_dask(self, ddf):
 
         r = ddf.map_partitions(lambda df: np.array([[
@@ -1040,7 +1016,6 @@ class AreaToLineAxis1Ragged(_AreaToLineLike):
         return (self.maybe_expand_bounds(x_extents),
                 self.maybe_expand_bounds(y_extents))
 
-    @memoize
     def _build_extend(self, x_mapper, y_mapper, info, append, _antialias_stage_2,
                       _antialias_stage_2_funcs):
         expand_aggs_and_cols = self.expand_aggs_and_cols(append)

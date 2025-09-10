@@ -1,6 +1,5 @@
 import math
 
-from toolz import memoize
 import numpy as np
 
 from datashader.glyphs.glyph import Glyph
@@ -105,7 +104,6 @@ class QuadMeshRectilinear(_QuadMeshLike):
         # Infer breaks for 1D array of centers
         return infer_interval_breaks(centers)
 
-    @memoize
     def _build_extend(self, x_mapper, y_mapper, info, append, _antialias_stage_2,
                       _antialias_stage_2_funcs):
         x_name = self.x
@@ -277,7 +275,6 @@ class QuadMeshRaster(QuadMeshRectilinear):
 
         return upsample_width, upsample_height
 
-    @memoize
     def _build_extend(self, x_mapper, y_mapper, info, append, _antialias_stage_2,
                       _antialias_stage_2_funcs):
         x_name = self.x
@@ -452,7 +449,6 @@ class QuadMeshCurvilinear(_QuadMeshLike):
         breaks = infer_interval_breaks(breaks, axis=0)
         return breaks
 
-    @memoize
     def _build_extend(self, x_mapper, y_mapper, info, append, _antialias_stage_2,
                       _antialias_stage_2_funcs):
         x_name = self.x

@@ -1,7 +1,7 @@
 from __future__ import annotations
 import math
-import numpy as np
 from toolz import memoize
+import numpy as np
 
 # NOTE: This import must be early to ensure Numba cache dir and precise caching is initialized
 import datashader.cre_numba_init  # initialize precise Numba caching and cache dirs

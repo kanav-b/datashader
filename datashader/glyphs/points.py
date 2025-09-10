@@ -1,7 +1,6 @@
 from __future__ import annotations
 from packaging.version import Version
 import numpy as np
-from toolz import memoize
 
 from datashader.glyphs.glyph import Glyph
 from datashader.utils import isreal, ngjit
@@ -156,7 +155,6 @@ class _GeometryLike(Glyph):
             bounds = col.array.total_bounds_y
         return self.maybe_expand_bounds(bounds)
 
-    @memoize
     def compute_bounds_dask(self, ddf):
         total_bounds = ddf[self.geometry].total_bounds
         x_extents = (total_bounds[0], total_bounds[2])
@@ -229,7 +227,6 @@ class _PointLike(Glyph):
             bounds = self._compute_bounds(df[self.y])
         return self.maybe_expand_bounds(bounds)
 
-    @memoize
     def compute_bounds_dask(self, ddf):
 
         r = ddf.map_partitions(lambda df: np.array([[
@@ -258,7 +255,6 @@ class Point(_PointLike):
     x, y : str
         Column names for the x and y coordinates of each point.
     """
-    @memoize
     def _build_extend(self, x_mapper, y_mapper, info, append, _antialias_stage_2,
                       _antialias_stage_2_funcs):
         
@@ -309,7 +305,6 @@ class MultiPointGeoPandas(_GeometryLike):
         from geopandas.array import GeometryDtype
         return (GeometryDtype,)
 
-    @memoize
     def _build_extend(
         self, x_mapper, y_mapper, info, append, _antialias_stage_2, _antialias_stage_2_funcs,
     ):
@@ -390,7 +385,6 @@ class MultiPointGeometry(_GeometryLike):
         from spatialpandas.geometry import PointDtype, MultiPointDtype
         return PointDtype, MultiPointDtype
 
-    @memoize
     def _build_extend(self, x_mapper, y_mapper, info, append, _antialias_stage_2,
                       _antialias_stage_2_funcs):
         geometry_name = self.geometry
