@@ -107,6 +107,7 @@ Dispatcher.enable_precise_caching = enable_precise_caching
 
 # --- COMPLETELY NEW ARCHITECTURE: Simple, Static, Cacheable Functions ---
 from numba import njit
+from datashader.compiler import _cache_emit_njit
 
 @njit(cache=True)
 def draw_line_segment(
@@ -1423,212 +1424,210 @@ def _x_intercept(y, cx0, cy0, cx1, cy1):
     return cx0 + frac*(cx1 - cx0)
 
 
-def _build_full_antialias(expand_aggs_and_cols):
-    """Specialize antialiased line drawing algorithm for a given append/axis combination"""
-    @ngjit_no_cache
-    @expand_aggs_and_cols
-    def _full_antialias(line_width, overwrite, i, x0, x1, y0, y1,
-                        segment_start, segment_end, xm, ym, append,
-                        nx, ny, buffer, *aggs_and_cols):
-        """Draw an antialiased line segment.
+def _build_full_antialias(expand_aggs_and_cols, append):
+    """Generate a cacheable full antialias kernel with fixed args (no varargs)."""
+    import math  # for building source reference
+    n_extra = _infer_aggs_cols_len(expand_aggs_and_cols)
+    arg_names = [f"_{i}" for i in range(n_extra)]
+    args_join = ", ".join(arg_names)
 
-        If overwrite=True can overwrite each pixel multiple times because
-        using max for the overwriting.  If False can only write each pixel
-        once per segment and its previous segment.
-        Argument xm, ym are only valid if overwrite and segment_start are False.
-        """
-        if x0 == x1 and y0 == y1:
-            return
+    header = (
+        "def full_aa(line_width, overwrite, i, x0, x1, y0, y1, "
+        "segment_start, segment_end, xm, ym, nx, ny, " + args_join + "):"
+    )
+    body = [
+        "    if x0 == x1 and y0 == y1:",
+        "        return",
+        "    # Allocate local buffer (8 values)",
+        "    buffer = np.empty(8, dtype=np.float64)",
+        "    flip_xy = abs(x0-x1) < abs(y0-y1)",
+        "    if flip_xy:",
+        "        x0, y0 = y0, x0",
+        "        x1, y1 = y1, x1",
+        "        xm, ym = ym, xm",
+        "    scale = 1.0",
+        "    if line_width < 1.0:",
+        "        scale *= line_width",
+        "        line_width = 1.0",
+        "    aa = 1.0",
+        "    halfwidth = 0.5*(line_width + aa)",
+        "    flip_order = y1 < y0 or (y1 == y0 and x1 < x0)",
+        "    alongx = float(x1 - x0)",
+        "    alongy = float(y1 - y0)",
+        "    length = math.sqrt(alongx**2 + alongy**2)",
+        "    alongx /= length",
+        "    alongy /= length",
+        "    rightx = alongy",
+        "    righty = -alongx",
+        "    if flip_order:",
+        "        buffer[0] = x1 - halfwidth*( rightx - alongx)",
+        "        buffer[1] = x1 - halfwidth*(-rightx - alongx)",
+        "        buffer[2] = x0 - halfwidth*(-rightx + alongx)",
+        "        buffer[3] = x0 - halfwidth*( rightx + alongx)",
+        "        buffer[4] = y1 - halfwidth*( righty - alongy)",
+        "        buffer[5] = y1 - halfwidth*(-righty - alongy)",
+        "        buffer[6] = y0 - halfwidth*(-righty + alongy)",
+        "        buffer[7] = y0 - halfwidth*( righty + alongy)",
+        "    else:",
+        "        buffer[0] = x0 + halfwidth*( rightx - alongx)",
+        "        buffer[1] = x0 + halfwidth*(-rightx - alongx)",
+        "        buffer[2] = x1 + halfwidth*(-rightx + alongx)",
+        "        buffer[3] = x1 + halfwidth*( rightx + alongx)",
+        "        buffer[4] = y0 + halfwidth*( righty - alongy)",
+        "        buffer[5] = y0 + halfwidth*(-righty - alongy)",
+        "        buffer[6] = y1 + halfwidth*(-righty + alongy)",
+        "        buffer[7] = y1 + halfwidth*( righty + alongy)",
+        "    xmax = nx-1",
+        "    ymax = ny-1",
+        "    if flip_xy:",
+        "        xmax, ymax = ymax, xmax",
+        "    if flip_order:",
+        "        lowindex = 0 if x0 > x1 else 1",
+        "    else:",
+        "        lowindex = 0 if x1 > x0 else 1",
+        "    if not overwrite and not segment_start:",
+        "        prev_alongx = x0 - xm",
+        "        prev_alongy = y0 - ym",
+        "        prev_length = math.sqrt(prev_alongx**2 + prev_alongy**2)",
+        "        if prev_length > 0.0:",
+        "            prev_alongx /= prev_length",
+        "            prev_alongy /= prev_length",
+        "            prev_rightx = prev_alongy",
+        "            prev_righty = -prev_alongx",
+        "        else:",
+        "            overwrite = True",
+        "    ystart = _clamp(math.ceil(buffer[4 + lowindex]), 0, ymax)",
+        "    yend = _clamp(math.floor(buffer[4 + (lowindex+2) % 4]), 0, ymax)",
+        "    ll = lowindex",
+        "    lu = (ll + 1) % 4",
+        "    rl = lowindex",
+        "    ru = (rl + 3) % 4",
+        "    for y in range(ystart, yend+1):",
+        "        if ll == lowindex and y > buffer[4 + lu]:",
+        "            ll = lu",
+        "            lu = (ll + 1) % 4",
+        "        if rl == lowindex and y > buffer[4 + ru]:",
+        "            rl = ru",
+        "            ru = (rl + 3) % 4",
+        "        xleft = _clamp(math.ceil(_x_intercept(y, buffer[ll], buffer[4+ll], buffer[lu], buffer[4+lu])), 0, xmax)",
+        "        xright = _clamp(math.floor(_x_intercept(y, buffer[rl], buffer[4+rl], buffer[ru], buffer[4+ru])), 0, xmax)",
+        "        for x in range(xleft, xright+1):",
+        "            along = (x-x0)*alongx + (y-y0)*alongy",
+        "            prev_correction = False",
+        "            if along < 0.0:",
+        "                if overwrite or segment_start or (x-x0)*prev_alongx + (y-y0)*prev_alongy > 0.0:",
+        "                    distance = math.sqrt((x-x0)**2 + (y-y0)**2)",
+        "                else:",
+        "                    continue",
+        "            elif along > length:",
+        "                if overwrite or segment_end:",
+        "                    distance = math.sqrt((x-x1)**2 + (y-y1)**2)",
+        "                else:",
+        "                    continue",
+        "            else:",
+        "                distance = abs((x-x0)*rightx + (y-y0)*righty)",
+        "                if not overwrite and not segment_start and -prev_length <= (x-x0)*prev_alongx + (y-y0)*prev_alongy <= 0.0 and abs((x-x0)*prev_rightx + (y-y0)*prev_righty) <= halfwidth:",
+        "                    prev_correction = True",
+        "            value = 1.0 - _linearstep(0.5*(line_width - aa), halfwidth, distance)",
+        "            value *= scale",
+        "            prev_value = 0.0",
+        "            if prev_correction:",
+        "                prev_distance = abs((x-x0)*prev_rightx + (y-y0)*prev_righty)",
+        "                prev_value = 1.0 - _linearstep(0.5*(line_width - aa), halfwidth, prev_distance)",
+        "                prev_value *= scale",
+        "                if value <= prev_value:",
+        "                    value = 0.0",
+        "            if value > 0.0:",
+        "                xx, yy = (y, x) if flip_xy else (x, y)",
+        f"                append(i, xx, yy, value, prev_value, {args_join})",
+    ]
 
-        # Scan occurs in y-direction. But wish to scan in the shortest direction,
-        # so if |x0-x1| < |y0-y1| then flip (x,y) coords for maths and flip back
-        # again before setting pixels.
-        flip_xy = abs(x0-x1) < abs(y0-y1)
-        if flip_xy:
-            x0, y0 = y0, x0
-            x1, y1 = y1, x1
-            xm, ym = ym, xm
-
-        scale = 1.0
-
-        # line_width less than 1 is rendered as 1 but with lower intensity.
-        if line_width < 1.0:
-            scale *= line_width
-            line_width = 1.0
-
-        aa = 1.0
-        halfwidth = 0.5*(line_width + aa)
-
-        # Want y0 <= y1, so switch vertical direction if this is not so.
-        flip_order = y1 < y0 or (y1 == y0 and x1 < x0)
-
-        # Start (x0, y0), end (y0, y1)
-        #       c1 +-------------+ c2          along    | right
-        # (x0, y0) | o         o | (x1, y1)    vector   | vector
-        #       c0 +-------------+ c3          ---->    v
-
-        alongx = float(x1 - x0)
-        alongy = float(y1 - y0)  # Always +ve
-        length = math.sqrt(alongx**2 + alongy**2)
-        alongx /= length
-        alongy /= length
-
-        rightx = alongy
-        righty = -alongx
-
-        # 4 corners, x and y.  Uses buffer, which must have length 8.  Order of coords is
-        # (x0, x1, x2, x3, y0, y1, y2, y3).  Each CPU/GPU thread has its own local buffer
-        # so there is no cross-talk.  Contents of buffer are written and read within the
-        # lifetime of this function, so it doesn't matter what they are before this
-        # function is called or after it returns.
-        if flip_order:
-            buffer[0] = x1 - halfwidth*( rightx - alongx)
-            buffer[1] = x1 - halfwidth*(-rightx - alongx)
-            buffer[2] = x0 - halfwidth*(-rightx + alongx)
-            buffer[3] = x0 - halfwidth*( rightx + alongx)
-            buffer[4] = y1 - halfwidth*( righty - alongy)
-            buffer[5] = y1 - halfwidth*(-righty - alongy)
-            buffer[6] = y0 - halfwidth*(-righty + alongy)
-            buffer[7] = y0 - halfwidth*( righty + alongy)
-        else:
-            buffer[0] = x0 + halfwidth*( rightx - alongx)
-            buffer[1] = x0 + halfwidth*(-rightx - alongx)
-            buffer[2] = x1 + halfwidth*(-rightx + alongx)
-            buffer[3] = x1 + halfwidth*( rightx + alongx)
-            buffer[4] = y0 + halfwidth*( righty - alongy)
-            buffer[5] = y0 + halfwidth*(-righty - alongy)
-            buffer[6] = y1 + halfwidth*(-righty + alongy)
-            buffer[7] = y1 + halfwidth*( righty + alongy)
-
-        xmax = nx-1
-        ymax = ny-1
-        if flip_xy:
-            xmax, ymax = ymax, xmax
-
-        # Index of lowest-y point.
-        if flip_order:
-            lowindex = 0 if x0 > x1 else 1
-        else:
-            lowindex = 0 if x1 > x0 else 1
-
-        if not overwrite and not segment_start:
-            prev_alongx = x0 - xm
-            prev_alongy = y0 - ym
-            prev_length = math.sqrt(prev_alongx**2 + prev_alongy**2)
-            if prev_length > 0.0:
-                prev_alongx /= prev_length
-                prev_alongy /= prev_length
-                prev_rightx = prev_alongy
-                prev_righty = -prev_alongx
-            else:
-                overwrite = True
-
-        # y limits of scan.
-        ystart = _clamp(math.ceil(buffer[4 + lowindex]), 0, ymax)
-        yend = _clamp(math.floor(buffer[4 + (lowindex+2) % 4]), 0, ymax)
-        # Need to know which edges are to left and right; both will change.
-        ll = lowindex  # Index of lower point of left edge.
-        lu = (ll + 1) % 4  # Index of upper point of left edge.
-        rl = lowindex  # Index of lower point of right edge.
-        ru = (rl + 3) % 4  # Index of upper point of right edge.
-        for y in range(ystart, yend+1):
-            if ll == lowindex and y > buffer[4 + lu]:
-                ll = lu
-                lu = (ll + 1) % 4
-            if rl == lowindex and y > buffer[4 + ru]:
-                rl = ru
-                ru = (rl + 3) % 4
-            # Find x limits of scan at this y.
-            xleft = _clamp(math.ceil(_x_intercept(
-                y, buffer[ll], buffer[4+ll], buffer[lu], buffer[4+lu])), 0, xmax)
-            xright = _clamp(math.floor(_x_intercept(
-                y, buffer[rl], buffer[4+rl], buffer[ru], buffer[4+ru])), 0, xmax)
-            for x in range(xleft, xright+1):
-                along = (x-x0)*alongx + (y-y0)*alongy  # dot product
-                prev_correction = False
-                if along < 0.0:
-                    # Before start of segment
-                    if overwrite or segment_start or (x-x0)*prev_alongx + (y-y0)*prev_alongy > 0.0:
-                        distance = math.sqrt((x-x0)**2 + (y-y0)**2)  # round join/end cap
-                    else:
-                        continue
-                elif along > length:
-                    # After end of segment
-                    if overwrite or segment_end:
-                        distance = math.sqrt((x-x1)**2 + (y-y1)**2)  # round join/end cap
-                    else:
-                        continue
-                else:
-                    # Within segment
-                    distance = abs((x-x0)*rightx + (y-y0)*righty)
-                    if not overwrite and not segment_start and \
-                            -prev_length <= (x-x0)*prev_alongx + (y-y0)*prev_alongy <= 0.0 and \
-                            abs((x-x0)*prev_rightx + (y-y0)*prev_righty) <= halfwidth:
-                        prev_correction = True
-                value = 1.0 - _linearstep(0.5*(line_width - aa), halfwidth, distance)
-                value *= scale
-                prev_value = 0.0
-                if prev_correction:
-                    # Already set pixel from previous segment, need to correct it
-                    prev_distance = abs((x-x0)*prev_rightx + (y-y0)*prev_righty)
-                    prev_value = 1.0 - _linearstep(0.5*(line_width - aa), halfwidth, prev_distance)
-                    prev_value *= scale
-                    if value <= prev_value:
-                        # Have already used a larger value (alpha) for this pixel.
-                        value = 0.0
-                if value > 0.0:
-                    xx, yy = (y, x) if flip_xy else (x, y)
-                    append(i, xx, yy, value, prev_value, *aggs_and_cols)
-
-    return _full_antialias
+    lines = [header] + body
+    spec_parts = [
+        "full_aa",
+        ("n_extra", n_extra),
+    ]
+    full = _cache_emit_njit(
+        "full_aa", lines, spec_parts,
+        extra_imports=["import math"],
+        bindings={
+            "append": append,
+            "_clamp": _clamp,
+            "_linearstep": _linearstep,
+            "_x_intercept": _x_intercept,
+        },
+    )
+    return full
 
 
-def _build_bresenham(expand_aggs_and_cols):
-    """Specialize a bresenham kernel for a given append/axis combination"""
-    @ngjit_no_cache
-    @expand_aggs_and_cols
-    def _bresenham(i, sx, tx, sy, ty, xmin, xmax, ymin, ymax, segment_start,
-                   x0, x1, y0, y1, clipped, append, *aggs_and_cols):
-        """Draw a line segment using Bresenham's algorithm
-        This method plots a line segment with integer coordinates onto a pixel
-        grid.
-        """
-        dx = x1 - x0
-        ix = (dx > 0) - (dx < 0)
-        dx = abs(dx) * 2
+def _infer_aggs_cols_len(expand_aggs_and_cols):
+    """Infer the fixed aggs_and_cols length from the expander without codegen."""
+    import inspect
+    def _dummy(*aggs_and_cols):
+        return None
+    fn = expand_aggs_and_cols(_dummy)
+    spec = inspect.getfullargspec(fn)
+    return len(spec.args)
 
-        dy = y1 - y0
-        iy = (dy > 0) - (dy < 0)
-        dy = abs(dy) * 2
 
-        # If vertices weren't clipped and are concurrent in integer space,
-        # call append and return, so that the second vertex won't be hit below.
-        if not clipped and not (dx | dy):
-            append(i, x0, y0, *aggs_and_cols)
-            return
+def _build_bresenham(expand_aggs_and_cols, append):
+    """Generate a cacheable Bresenham kernel with fixed args (no varargs)."""
+    n_extra = _infer_aggs_cols_len(expand_aggs_and_cols)
+    arg_names = [f"_{i}" for i in range(n_extra)]
+    args_join = ", ".join(arg_names)
 
-        if segment_start:
-            append(i, x0, y0, *aggs_and_cols)
+    header = (
+        "def bresenham(i, sx, tx, sy, ty, xmin, xmax, ymin, ymax, segment_start, "
+        "x0, x1, y0, y1, clipped, " + args_join + "):"
+    )
+    body = [
+        "    dx = x1 - x0",
+        "    ix = (dx > 0) - (dx < 0)",
+        "    dx = abs(dx) * 2",
+        "",
+        "    dy = y1 - y0",
+        "    iy = (dy > 0) - (dy < 0)",
+        "    dy = abs(dy) * 2",
+        "",
+        "    # If vertices weren't clipped and are concurrent in integer space,",
+        "    # call append and return, so that the second vertex won't be hit below.",
+        "    if not clipped and not (dx | dy):",
+        f"        append(i, x0, y0, {args_join})",
+        "        return",
+        "",
+        "    if segment_start:",
+        f"        append(i, x0, y0, {args_join})",
+        "",
+        "    if dx >= dy:",
+        "        error = 2 * dy - dx",
+        "        while x0 != x1:",
+        "            if error >= 0 and (error or ix > 0):",
+        "                error -= 2 * dx",
+        "                y0 += iy",
+        "            error += 2 * dy",
+        "            x0 += ix",
+        f"            append(i, x0, y0, {args_join})",
+        "    else:",
+        "        error = 2 * dx - dy",
+        "        while y0 != y1:",
+        "            if error >= 0 and (error or iy > 0):",
+        "                error -= 2 * dy",
+        "                x0 += ix",
+        "            error += 2 * dx",
+        "            y0 += iy",
+        f"            append(i, x0, y0, {args_join})",
+    ]
 
-        if dx >= dy:
-            error = 2 * dy - dx
-            while x0 != x1:
-                if error >= 0 and (error or ix > 0):
-                    error -= 2 * dx
-                    y0 += iy
-                error += 2 * dy
-                x0 += ix
-                append(i, x0, y0, *aggs_and_cols)
-        else:
-            error = 2 * dx - dy
-            while y0 != y1:
-                if error >= 0 and (error or iy > 0):
-                    error -= 2 * dy
-                    x0 += ix
-                error += 2 * dx
-                y0 += iy
-                append(i, x0, y0, *aggs_and_cols)
-    return _bresenham
+    lines = [header] + body
+    spec_parts = [
+        "bresenham",
+        ("n_extra", n_extra),  # number of fixed aggs_and_cols args
+    ]
+    # Emit cacheable kernel
+    # Bind the numba-compiled append dispatcher into module scope to avoid
+    # passing it as a parameter (improves cache reuse across processes).
+    bres = _cache_emit_njit("bresenham", lines, spec_parts, bindings={"append": append})
+    return bres
 
 # try moving the ngjit and expanf aggs and cols decorator to the this top level and see if it works
 
@@ -1637,9 +1636,9 @@ def _build_draw_segment(append, map_onto_pixel, expand_aggs_and_cols, line_width
 
     if line_width > 0.0:
         _bresenham = None
-        _full_antialias = _build_full_antialias(expand_aggs_and_cols)
+        _full_antialias = _build_full_antialias(expand_aggs_and_cols, append)
     else:
-        _bresenham = _build_bresenham(expand_aggs_and_cols)
+        _bresenham = _build_bresenham(expand_aggs_and_cols, append)
         _full_antialias = None
 
     @ngjit_no_cache
@@ -1692,12 +1691,12 @@ def _build_draw_segment(append, map_onto_pixel, expand_aggs_and_cols, line_width
                 nx = round((xmax - xmin)*sx)
                 ny = round((ymax - ymin)*sy)
                 _full_antialias(line_width, overwrite, i, x0_2, x1_2, y0_2, y1_2,
-                                segment_start, segment_end, xm_2, ym_2, append,
-                                nx, ny, buffer, *aggs_and_cols)
+                                segment_start, segment_end, xm_2, ym_2,
+                                nx, ny, *aggs_and_cols)
             else:
                 _bresenham(i, sx, tx, sy, ty, xmin, xmax, ymin, ymax,
                            segment_start, x0_2, x1_2, y0_2, y1_2,
-                           clipped, append, *aggs_and_cols)
+                           clipped, *aggs_and_cols)
 
     return draw_segment
 
