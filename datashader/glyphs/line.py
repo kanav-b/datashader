@@ -792,109 +792,36 @@ class LinesAxis1(_PointLike, _AntiAliasedLine):
     def _internal_build_extend(
             self, x_mapper, y_mapper, info, append, line_width, antialias_stage_2,
             antialias_stage_2_funcs):
-        # Simple implementation that bypasses the complex original architecture
-        # This ensures we can cache the functions properly
-        
-        @njit(cache=True)
-        def simple_line_draw(xs, ys, sx, tx, sy, ty, xmin, xmax, ymin, ymax, agg):
-            """Simple line drawing that can be cached"""
-            n_points = len(xs)
-            if n_points < 2:
-                return
-                
-            for i in range(n_points - 1):
-                x0, y0 = xs[i], ys[i]
-                x1, y1 = xs[i + 1], ys[i + 1]
-                
-                # Skip NaN values
-                if isnull(x0) or isnull(y0) or isnull(x1) or isnull(y1):
-                    continue
-                
-                # Convert to pixel coordinates
-                x0_px = int(x0 * sx + tx)
-                y0_px = int(y0 * sy + ty)
-                x1_px = int(x1 * sx + tx)
-                y1_px = int(y1 * sy + ty)
-                
-                # Simple line drawing
-                dx = abs(x1_px - x0_px)
-                dy = abs(y1_px - y0_px)
-                
-                if dx == 0 and dy == 0:
-                    # Single point
-                    if 0 <= x0_px < agg.shape[1] and 0 <= y0_px < agg.shape[0]:
-                        agg[y0_px, x0_px] += 1.0
-                elif dx > dy:
-                    # Horizontal line
-                    if x0_px > x1_px:
-                        x0_px, x1_px = x1_px, x0_px
-                        y0_px, y1_px = y1_px, y0_px
-                    
-                    for x in range(x0_px, x1_px + 1):
-                        if x1_px == x0_px:
-                            y = y0_px
-                        else:
-                            y = int(y0_px + (y1_px - y0_px) * (x - x0_px) / (x1_px - x0_px))
-                        if 0 <= x < agg.shape[1] and 0 <= y < agg.shape[0]:
-                            agg[y, x] += 1.0
-                else:
-                    # Vertical line
-                    if y0_px > y1_px:
-                        x0_px, x1_px = x1_px, x0_px
-                        y0_px, y1_px = y1_px, y0_px
-                    
-                    for y in range(y0_px, y1_px + 1):
-                        if y1_px == y0_px:
-                            x = x0_px
-                        else:
-                            x = int(x0_px + (x1_px - x0_px) * (y - y0_px) / (y1_px - y0_px))
-                        if 0 <= x < agg.shape[1] and 0 <= y < agg.shape[0]:
-                            agg[y, x] += 1.0
-        
+        # Use precise pipeline for axis=1 (columns per row)
+        expand_aggs_and_cols = self.expand_aggs_and_cols(append)
+        draw_segment, antialias_stage_2_funcs = _line_internal_build_extend(
+            x_mapper, y_mapper, append, line_width, antialias_stage_2,
+            antialias_stage_2_funcs, expand_aggs_and_cols,
+        )
+        extend_cpu, _extend_cuda = _build_extend_line_axis1_none_constant(
+            draw_segment, expand_aggs_and_cols, antialias_stage_2_funcs,
+        )
+
+        x_name = self.x
+        y_names = self.y
+
         def extend(aggs, df, vt, bounds, plot_start=True):
             sx, tx, sy, ty = vt
             xmin, xmax, ymin, ymax = bounds
-            
-            # Get the aggregation array and initialize it to 0
-            agg = aggs[0]
-            agg.fill(0.0)  # Initialize to 0 instead of NaN
-            
-            # Get x and y coordinates
-            if hasattr(self, 'x') and hasattr(self, 'y'):
-                # For LineAxis1 (multiple lines)
-                if isinstance(self.x, (list, tuple)) and isinstance(self.y, (list, tuple)):
-                    for x_col, y_col in zip(self.x, self.y):
-                        # Handle both column names and column indices
-                        if isinstance(x_col, (int, np.integer)):
-                            xs = df.iloc[:, x_col].values
-                        else:
-                            xs = df[x_col].values
-                            
-                        if isinstance(y_col, (int, np.integer)):
-                            ys = df.iloc[:, y_col].values
-                        else:
-                            ys = df[y_col].values
-                            
-                        simple_line_draw(xs, ys, sx, tx, sy, ty, xmin, xmax, ymin, ymax, agg)
-                else:
-                    # For LineAxis0 (single line)
-                    if isinstance(self.x, (int, np.integer)):
-                        xs = df.iloc[:, self.x].values
-                    else:
-                        xs = df[self.x].values
-                        
-                    if isinstance(self.y, (int, np.integer)):
-                        ys = df.iloc[:, self.y].values
-                    else:
-                        ys = df[self.y].values
-                        
-                    simple_line_draw(xs, ys, sx, tx, sy, ty, xmin, xmax, ymin, ymax, agg)
+            aggs_and_cols = aggs + info(df, aggs[0].shape[:2])
+
+            # Build xs,ys arrays with shape (nrows, ncols)
+            if isinstance(x_name, (list, tuple)):
+                xs = df.loc[:, list(x_name)].to_numpy()
             else:
-                # Fallback for other line types
-                xs = df['x'].values if 'x' in df else df.iloc[:, 0].values
-                ys = df['y'].values if 'y' in df else df.iloc[:, 1].values
-                simple_line_draw(xs, ys, sx, tx, sy, ty, xmin, xmax, ymin, ymax, agg)
-        
+                xs = np.tile(df[x_name].to_numpy()[:, None], (1, len(y_names)))
+            ys = df.loc[:, list(y_names)].to_numpy()
+
+            extend_cpu(
+                sx, tx, sy, ty, xmin, xmax, ymin, ymax,
+                xs, ys, antialias_stage_2, *aggs_and_cols,
+            )
+
         return extend
 
 
@@ -1852,7 +1779,7 @@ def _build_extend_line_axis1_none_constant(draw_segment, expand_aggs_and_cols,
         aa_stage_2_accumulate, aa_stage_2_clear, aa_stage_2_copy_back = antialias_stage_2_funcs
     use_2_stage_agg = antialias_stage_2_funcs is not None
 
-    @ngjit
+    @ngjit_no_cache
     @expand_aggs_and_cols
     def perform_extend_line(
             i, j, sx, tx, sy, ty, xmin, xmax, ymin, ymax,
@@ -1879,7 +1806,7 @@ def _build_extend_line_axis1_none_constant(draw_segment, expand_aggs_and_cols,
                      segment_start, segment_end, x0, x1, y0, y1,
                      xm, ym, buffer, *aggs_and_cols)
 
-    @ngjit
+    @ngjit_no_cache
     @expand_aggs_and_cols
     def extend_cpu(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys, antialias_stage_2,
                    *aggs_and_cols):
@@ -1900,7 +1827,7 @@ def _build_extend_line_axis1_none_constant(draw_segment, expand_aggs_and_cols,
         cpu_antialias_2agg_impl(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys,
                                 antialias_stage_2, aggs_and_accums, *aggs_and_cols)
 
-    @ngjit
+    @ngjit_no_cache
     @expand_aggs_and_cols
     def cpu_antialias_2agg_impl(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys,
                                 antialias_stage_2, aggs_and_accums, *aggs_and_cols):
@@ -2339,7 +2266,7 @@ def _build_extend_line_axis1_geometry(draw_segment, expand_aggs_and_cols, antial
             closed_rings, antialias_stage_2, *aggs_and_cols
         )
 
-    @ngjit
+    @ngjit_no_cache
     @expand_aggs_and_cols
     def extend_cpu_numba(
             sx, tx, sy, ty, xmin, xmax, ymin, ymax,

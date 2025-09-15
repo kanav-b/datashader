@@ -271,10 +271,14 @@ class Point(_PointLike):
             x = xs[i]
             y = ys[i]
             if (xmin <= x <= xmax) and (ymin <= y <= ymax):
-                xx = int(x * sx + tx)
-                yy = int(y * sy + ty)
-                xi = xx - 1 if x == xmax else xx
-                yi = yy - 1 if y == ymax else yy
+                # Map using provided axis mappers
+                xx = int(x_mapper(x) * sx + tx)
+                yy = int(y_mapper(y) * sy + ty)
+                # Compute mapped upper bounds and apply snapping at upper edge
+                xxmax = round(x_mapper(xmax) * sx + tx)
+                yymax = round(y_mapper(ymax) * sy + ty)
+                xi = xx - 1 if xx == xxmax else xx
+                yi = yy - 1 if yy == yymax else yy
                 append(i, xi, yi, *aggs_and_cols)
 
         @ngjit_no_cache
