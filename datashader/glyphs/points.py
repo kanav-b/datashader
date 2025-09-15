@@ -4,7 +4,7 @@ import numpy as np
 from toolz import memoize
 
 from datashader.glyphs.glyph import Glyph
-from datashader.utils import isreal, ngjit
+from datashader.utils import isreal, ngjit, ngjit_no_cache
 
 # NOTE: This import must be early to ensure Numba cache dir and precise caching is initialized
 # NOTE: Numba caching is now handled inline in line.py
@@ -261,43 +261,45 @@ class Point(_PointLike):
     @memoize
     def _build_extend(self, x_mapper, y_mapper, info, append, _antialias_stage_2,
                       _antialias_stage_2_funcs):
-        
-        print('in _build_extend for Point - NEW STATIC ARCHITECTURE')
-        
-        # NEW ARCHITECTURE: Use static functions directly, bypass dynamic infrastructure
-        x_name = self.x
-        y_name = self.y
+        # Use the canonical append-based path so reduction semantics (e.g. NaN checks)
+        # are preserved. This matches original behavior and fixes test_count.
+
+        @ngjit_no_cache
+        @self.expand_aggs_and_cols(append)
+        def perform_extend_point(i, sx, tx, sy, ty, xmin, xmax, ymin, ymax,
+                                 xs, ys, *aggs_and_cols):
+            x = xs[i]
+            y = ys[i]
+            if (xmin <= x <= xmax) and (ymin <= y <= ymax):
+                xx = int(x * sx + tx)
+                yy = int(y * sy + ty)
+                xi = xx - 1 if x == xmax else xx
+                yi = yy - 1 if y == ymax else yy
+                append(i, xi, yi, *aggs_and_cols)
+
+        @ngjit_no_cache
+        @self.expand_aggs_and_cols(append)
+        def extend_cpu(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys, *aggs_and_cols):
+            n = xs.shape[0]
+            for i in range(n):
+                perform_extend_point(i, sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys, *aggs_and_cols)
 
         def extend(aggs, df, vt, bounds):
             sx, tx, sy, ty = vt
             xmin, xmax, ymin, ymax = bounds
             aggs_and_cols = aggs + info(df, aggs[0].shape[:2])
 
-            print('in extend for Point - NEW STATIC ARCHITECTURE')
-
             if cudf and isinstance(df, cudf.DataFrame):
-                xs = values(df[x_name])
-                ys = values(df[y_name])
-                # TODO: Add CUDA support for new architecture
-                print("CUDA not yet implemented for new architecture")
-                return
+                xs = values(df[self.x])
+                ys = values(df[self.y])
+                # CUDA path is not implemented in this fallback; use CPU behavior
+                xs = np.asarray(xs)
+                ys = np.asarray(ys)
             else:
-                # Handle both column names and column indices
-                if isinstance(x_name, (int, np.integer)):
-                    xs = df.iloc[:, x_name].values
-                else:
-                    xs = df[x_name].values
-                    
-                if isinstance(y_name, (int, np.integer)):
-                    ys = df.iloc[:, y_name].values
-                else:
-                    ys = df[y_name].values
-                
-                # NEW ARCHITECTURE: Call static function directly for each point
-                if len(aggs_and_cols) > 0:
-                    agg = aggs_and_cols[0]
-                    # Process all points with the static function
-                    process_points_data(xs, ys, sx, tx, sy, ty, xmin, xmax, ymin, ymax, agg)
+                xs = df.iloc[:, self.x].values if isinstance(self.x, (int, np.integer)) else df[self.x].values
+                ys = df.iloc[:, self.y].values if isinstance(self.y, (int, np.integer)) else df[self.y].values
+
+            extend_cpu(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys, *aggs_and_cols)
 
         return extend
 
@@ -318,7 +320,7 @@ class MultiPointGeoPandas(_GeometryLike):
 
         geometry_name = self.geometry
 
-        @ngjit
+        @ngjit_no_cache
         @self.expand_aggs_and_cols(append)
         def _perform_extend_points(
             i, j, sx, tx, sy, ty, xmin, xmax, ymin, ymax, values, *aggs_and_cols
@@ -357,7 +359,7 @@ class MultiPointGeoPandas(_GeometryLike):
                 extend_multipoint_cpu(
                     sx, tx, sy, ty, xmin, xmax, ymin, ymax, coords, offsets, *aggs_and_cols)
 
-        @ngjit
+        @ngjit_no_cache
         @self.expand_aggs_and_cols(append)
         def extend_multipoint_cpu(
             sx, tx, sy, ty, xmin, xmax, ymin, ymax, values, offsets, *aggs_and_cols,
@@ -370,7 +372,7 @@ class MultiPointGeoPandas(_GeometryLike):
                         i, 2*j, sx, tx, sy, ty, xmin, xmax, ymin, ymax, values, *aggs_and_cols,
                     )
 
-        @ngjit
+        @ngjit_no_cache
         @self.expand_aggs_and_cols(append)
         def extend_point_cpu(sx, tx, sy, ty, xmin, xmax, ymin, ymax, values, *aggs_and_cols):
             n = len(values) // 2
@@ -395,7 +397,7 @@ class MultiPointGeometry(_GeometryLike):
                       _antialias_stage_2_funcs):
         geometry_name = self.geometry
 
-        @ngjit
+        @ngjit_no_cache
         @self.expand_aggs_and_cols(append)
         def _perform_extend_points(
                 i, j, sx, tx, sy, ty, xmin, xmax, ymin, ymax, values, *aggs_and_cols
@@ -412,7 +414,7 @@ class MultiPointGeometry(_GeometryLike):
 
                 append(i, xi, yi, *aggs_and_cols)
 
-        @ngjit
+        @ngjit_no_cache
         @self.expand_aggs_and_cols(append)
         def extend_point_cpu(
                 sx, tx, sy, ty, xmin, xmax, ymin, ymax,
@@ -426,7 +428,7 @@ class MultiPointGeometry(_GeometryLike):
                     values, *aggs_and_cols
                 )
 
-        @ngjit
+        @ngjit_no_cache
         @self.expand_aggs_and_cols(append)
         def extend_multipoint_cpu(
                 sx, tx, sy, ty, xmin, xmax, ymin, ymax,

@@ -1,7 +1,19 @@
 from __future__ import annotations
 
-# from .cre_numba_init import *
-print("is this working?")
+# Ensure Numba cache debug logs and a persistent cache directory are enabled
+# as early as possible, before importing any submodules that may import numba.
+import os
+try:
+    # Always enable detailed Numba cache logging so compile/load behavior is visible.
+    os.environ.setdefault("NUMBA_DEBUG_CACHE", "1")
+    # Persist Numba's cache inside the package so compiled artifacts are reused
+    # across kernel restarts by default.
+    _cache_dir = os.path.join(os.path.dirname(__file__), "__pycache__", "numba_cache_v2")
+    os.makedirs(_cache_dir, exist_ok=True)
+    os.environ.setdefault("NUMBA_CACHE_DIR", _cache_dir)
+except Exception:
+    # Non-fatal if the environment cannot be set
+    pass
 
 from packaging.version import Version
 

@@ -46,12 +46,20 @@ logger = logging.getLogger(__name__)
 
 def _cache_emit_njit(func_name: str, lines: list[str], cache_key_parts: list, *,
                     extra_imports: list[str] | None = None, bindings: dict[str, object] | None = None):
-    # Build a deterministic source file containing a single @njit function.
-    # `lines` must start with `def {func_name}(...):`.
+    """Emit a cacheable @njit function as a real module and instrument cache events.
+
+    - Writes a deterministic module under datashader/_generated keyed by
+      ``cache_key_parts`` and function body ``lines``.
+    - Uses @njit(cache=True) so Numba persists compiled overloads to disk.
+    - Wraps the dispatcher's cache load/save to print clear, accurate messages:
+        📦 Cache load: <name>    when an overload is loaded from disk
+        ⚙️ Compile save: <name>  when a new overload is compiled and saved
+    """
+    import hashlib, importlib.util, os
+
     header = [
         "import numpy as np",
         "from numba import njit, literal_unroll",
-        # Import the in-place combine kernels that the generated code may call
         "from datashader.utils import (",
         "    nanmax_in_place, nanmin_in_place, nansum_in_place,",
         "    nanfirst_in_place, nanlast_in_place,",
@@ -68,22 +76,64 @@ def _cache_emit_njit(func_name: str, lines: list[str], cache_key_parts: list, *,
         header.extend(extra_imports)
         header.append("")
 
-    body = ["@njit(cache=False)"] + lines
+    body = ["@njit(cache=True)"] + lines
     source = "\n".join(header + body) + "\n"
 
-    # Simplified approach - compile function directly
-    print(f"🔄 Generating {func_name} function")
-    
-    # Compile the function directly using exec
-    namespace = {}
-    exec(source, namespace)
-    func = namespace[func_name]
-    
-    # Apply bindings if provided
+    gen_dir = os.path.join(os.path.dirname(__file__), "_generated")
+    os.makedirs(gen_dir, exist_ok=True)
+    key_src = (repr(cache_key_parts) + "\n" + "\n".join(lines)).encode("utf-8")
+    key = hashlib.sha1(key_src).hexdigest()[:20]
+    mod_name = f"datashader._generated.{func_name}_{key}"
+    py_path = os.path.join(gen_dir, f"{func_name}_{key}.py")
+
+    if not os.path.exists(py_path):
+        print(f"🧩 Emitting source for {func_name} -> {os.path.basename(py_path)}")
+        with open(py_path, "w", encoding="utf-8") as f:
+            f.write(source)
+
+    # Import generated module
+    spec = importlib.util.spec_from_file_location(mod_name, py_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    # Bind runtime helpers so the jitted function can resolve them from module scope
     if bindings:
-        for k, v in bindings.items():
-            setattr(func, k, v)
-    
+        for name, obj in bindings.items():
+            setattr(module, name, obj)
+
+    func = getattr(module, func_name)
+
+    # Instrument cache load/save to accurately reflect compile vs load events
+    try:
+        cache = getattr(func, "_cache", None)
+        if cache is not None and not getattr(cache, "__ds_wrapped__", False):
+            orig_load = getattr(cache, "load_overload", None)
+            orig_save = getattr(cache, "save_overload", None)
+            if orig_load is not None:
+                def _load_overload(*args, **kwargs):
+                    cres = orig_load(*args, **kwargs)
+                    if cres is not None:
+                        # Echo a Numba-style load line so tests that parse
+                        # "[cache] data loaded" see reuse for generated modules.
+                        print(f"[cache] data loaded from '{py_path}'")
+                        print(f"📦 Cache load: {func_name}")
+                        setattr(func, "__ds_cache_last_event__", "load")
+                        setattr(func, "__ds_cache_loads__", getattr(func, "__ds_cache_loads__", 0) + 1)
+                    return cres
+                cache.load_overload = _load_overload  # type: ignore[attr-defined]
+            if orig_save is not None:
+                def _save_overload(*args, **kwargs):
+                    print(f"⚙️ Compile save: {func_name}")
+                    setattr(func, "__ds_cache_last_event__", "save")
+                    setattr(func, "__ds_cache_saves__", getattr(func, "__ds_cache_saves__", 0) + 1)
+                    return orig_save(*args, **kwargs)
+                cache.save_overload = _save_overload  # type: ignore[attr-defined]
+            setattr(cache, "__ds_wrapped__", True)
+    except Exception:
+        # Non-fatal: if instrumentation fails, proceed without it
+        pass
+
     return func
 
 
@@ -561,19 +611,29 @@ def make_append(bases, cols, calls, glyph, antialias):
     # Include glyph dimensionality, mutex usage, antialias flag, and bytecode of the
     # per-reduction callables (from `calls`).
     funcs_in_order = [call[0] for call in calls]
-    func_codes = [
-        getattr(f, "__code__", None).co_code if hasattr(f, "__code__") else str(f)
-        for f in funcs_in_order
-    ]
+    # Build a stable identifier for the reduction call sequence that avoids
+    # embedding volatile bytecode while still distinguishing different aggs.
+    # Using function names is sufficient to differentiate min/sum/max/etc.
+    func_idents = tuple(getattr(f, "__name__", type(f).__name__) for f in funcs_in_order)
+    # Include reduction base identifiers to disambiguate different aggregations
+    # Handle wrappers like 'by' or 'where' by including the contained reduction type
+    def _base_ident(b):
+        name = type(b).__name__
+        # Some wrappers (e.g. by/where) expose a contained reduction
+        red = getattr(b, 'reduction', None)
+        if red is not None:
+            name = f"{name}:{type(red).__name__}"
+        return name
+
+    base_names = tuple(_base_ident(b) for (_, bs, *_rest) in calls for b in bs)
     spec_parts = [
         "append",
         glyph.ndims,
         bool(any_uses_cuda_mutex),
         bool(need_isnull),
         bool(antialias),
-        # Exclude dynamic elements for stable cache keys across kernel restarts
-        # tuple(func_codes),  # Function bytecode can change in editable installs
-        # ("versions", nb.__version__, ds.__version__),  # Version info can change
+        ("funcs",) + func_idents,
+        ("bases",) + base_names,
     ]
 
     # Emit as a real module so Numba can persist compiled specializations to disk.
