@@ -5,7 +5,9 @@ from toolz import memoize
 from datashader.glyphs.glyph import Glyph
 from datashader.glyphs.line import _build_map_onto_pixel_for_line, _clipt
 from datashader.glyphs.points import _PointLike
-from datashader.utils import isnull, isreal, ngjit
+from datashader.utils import isnull, isreal, ngjit, ngjit_no_cache
+from datashader.compiler import _cache_emit_njit
+from datashader.glyphs.line import _infer_aggs_cols_len
 from numba import cuda
 
 try:
@@ -1077,7 +1079,7 @@ def _build_draw_trapezoid_y(append, map_onto_pixel, expand_aggs_and_cols):
     """Specialize a plotting kernel for drawing a trapezoid with two
     sides parallel to the y-axis"""
 
-    @ngjit
+    @ngjit_no_cache
     def clamp_y_indices(ystarti, ystopi, ymaxi):
         """Utility function to compute clamped y-indices"""
 
@@ -1099,64 +1101,12 @@ def _build_draw_trapezoid_y(append, map_onto_pixel, expand_aggs_and_cols):
 
         return out_of_bounds, clamped_ystarti, clamped_ystopi
 
-    @ngjit
+    @ngjit_no_cache
     @expand_aggs_and_cols
     def draw_trapezoid_y(
             i, sx, tx, sy, ty, xmin, xmax, ymin, ymax,
             x0, x1, y0, y1, y2, y3, trapezoid_start, stacked, *aggs_and_cols
     ):
-        """Draw a filled trapezoid that has two sides parallel to the y-axis
-
-        Such a trapezoid is defined by two x coordinates (x0 for the left
-        edge and x1 for the right parallel edge) and four y-coordinates
-        (y0 for top left vertex, y1 for bottom left vertex, y2 for the bottom
-        right vertex and y3 for the top right vertex).
-
-                                          (x1, y3)
-                                      _ +
-                        (x0, y0)  _--   |
-                                +       |
-                                |       |
-                                |       |
-                                +       |
-                        (x0, y1)  -     |
-                                    -   |
-                                      - |
-                                        +
-                                          (x1, y2)
-
-        In a proper trapezoid (as drawn above), y0 >= y1 and y3 >= y2 so that
-        edges do not intersect. This function also handles the case where
-        y1 < y0 or y2 < y3, which results in a crossing edge.
-
-        The trapezoid is filled using a vertical scan line algorithm where the
-        start and stop bins are calculated by what amounts to a pair of
-        Bresenham's line algorithms, one for the top edge and one for the
-        bottom edge.
-
-        Bins in the line connecting (x0, y1) and (x1, y2) are not filled if
-        the `stacked` argument is set to True. This way stacked trapezoids
-        will not have any overlapping bins.
-
-        Parameters
-        ----------
-        x0, x1: float
-            x-coordinate indices of the start and stop edge of the trapezoid
-        y0, y1, y2, y3: float
-            y-coordinate indices of the four corners of the trapezoid
-        xmin, xmax, ymin, ymax: float
-            The minimum and maximum allowable x and y value respectively.
-            The trapezoid will be clipped to these values.
-        i: int
-            Group index
-        trapezoid_start: bool
-            If True, the filled trapezoid will include the (x0, y0) to (x0, y1)
-            edge. Otherwise this edge will not be included.
-        stacked: bool
-            If False, the filled trapezoid will include the
-            (x0, y1) to (x1, y2) edge. Otherwise this edge will not
-            be included.
-        """
         x0, x1, y0, y1, y2, y3, skip, clipped_start, clipped_end = \
             _skip_or_clip_trapezoid_y(
                 x0, x1, y0, y1, y2, y3, xmin, xmax, ymin, ymax)
@@ -1201,59 +1151,36 @@ def _build_draw_trapezoid_y(append, map_onto_pixel, expand_aggs_and_cols):
             y_oob, y_start, y_stop = clamp_y_indices(y0i, y1i, ymaxi)
             x_oob = x0i < 0 or x0i > xmaxi
             if y_oob or x_oob:
-                # Out of bounds, nothing to do
                 pass
             elif y_start == y_stop and not stacked:
-                # No height, append to single bin if not in stacked mode
                 append(i, x0i, y_start, *aggs_and_cols)
             else:
-                # Non-zero height
                 y = y_start
                 iy = (y_start < y_stop) - (y_stop < y_start)
-
                 if not stacked and -1 <= y_stop + iy <= ymaxi + 1:
-                    # If not stacking, include bin on line from
-                    # (x0, y1) to (x1, y2), otherwise leave it out
                     y_stop += iy
-
                 while y != y_stop:
                     append(i, x0i, y, *aggs_and_cols)
                     y += iy
 
-        # Handle zero width cases
         clipped = clipped_start or clipped_end
         if dx == 0 and not clipped:
             y_oob, y_start, y_stop = clamp_y_indices(y3i, y2i, ymaxi)
             x_oob = x1i < 0 or x1i > xmaxi
-
-            # y0-y1 edge already aggregated above if plot_start.
-            # Now aggregate the y3-y2 edge
             if y_oob or x_oob:
-                # Out of bounds, nothing to do
                 pass
             elif y_start == y_stop and not stacked:
-                # No height, append to single bin if not in stacked mode
                 append(i, x1i, y_start, *aggs_and_cols)
             else:
-                # Non-zero height
                 y = y_start
                 iy = (y_start < y_stop) - (y_stop < y_start)
-
                 if not stacked and -1 <= y_stop + iy <= ymaxi + 1:
-                    # If not stacking, include bin on line from
-                    # (x0, y1) to (x1, y2), otherwise leave it
                     y_stop += iy
-
                 while y != y_stop:
                     append(i, x1i, y, *aggs_and_cols)
                     y += iy
             return
 
-        # Non-zero width.
-        # Compute initial Bresenham line errors using the integer formulation.
-        # Note that unlike that standard Bresenham's algorithm,
-        # we are forcing the "driving axis" to be x regardless of the
-        # relationship between x and y deltas.
         dx = abs(dx) * 2
         dy0 = abs(dy0) * 2
         dy1 = abs(dy1) * 2
@@ -1262,57 +1189,31 @@ def _build_draw_trapezoid_y(append, map_onto_pixel, expand_aggs_and_cols):
         error1 = 2 * dy1 - dx
 
         while x0i != x1i:
-            # Update error and y-bin index for y0 line.
-            #
-            # Note that in the standard Bresenham's algorithm this would be
-            # an if statement.  We need to make this a while statement in our
-            # case because we are forcing the x-axis to be the driving axis
-            # which requires the ability to increment the y-index multiple
-            # times for each step in the x-index.
             while error0 >= 0 and (error0 or ix > 0):
                 error0 -= 2 * dx
                 y0i += iy0
-
             error0 += 2 * dy0
 
-            # Update error and y-bin index for y1 line
             while error1 >= 0 and (error1 or ix > 0):
                 error1 -= 2 * dx
                 y1i += iy1
-
             error1 += 2 * dy1
 
-            # Update x
             x0i += ix
-
-            # Check if x0i is in bounds.
             x_oob = x0i < 0 or x0i > xmaxi
             if x_oob:
-                # Note that it's important that we have already updated the
-                # error values and y indices before continuing to the next
-                # loop iteration
                 continue
 
-            # Compute clamped y indices
             y_oob, y_start, y_stop = clamp_y_indices(y0i, y1i, ymaxi)
-
             if y_oob:
-                # Out of bounds, nothing to do
                 pass
             elif y_start == y_stop and not stacked:
-                # No height case, append to single bin if not in stacked mode
                 append(i, x0i, y_start, *aggs_and_cols)
             else:
-                # Non-zero height case,
-                # append to bins in trapezoid column
                 y = y_start
                 iy = (y_start < y_stop) - (y_stop < y_start)
-
                 if not stacked and -1 <= y_stop + iy <= ymaxi + 1:
-                    # If not stacking, aggregate bin on line from
-                    # (x0, y1) to (x1, y2), otherwise leave it out
                     y_stop += iy
-
                 while y != y_stop:
                     append(i, x0i, y, *aggs_and_cols)
                     y += iy
@@ -1383,7 +1284,7 @@ def _skip_or_clip_trapezoid_y(
 def _build_extend_area_to_zero_axis0(
         draw_trapezoid_y, expand_aggs_and_cols
 ):
-    @ngjit
+    @ngjit_no_cache
     @expand_aggs_and_cols
     def perform_extend(i, sx, tx, sy, ty, xmin, xmax, ymin, ymax,
                        plot_start, xs, ys, *aggs_and_cols):
@@ -1403,7 +1304,7 @@ def _build_extend_area_to_zero_axis0(
             x0, x1, y0, y1, y2, y3, trapezoid_start, stacked, *aggs_and_cols
         )
 
-    @ngjit
+    @ngjit_no_cache
     @expand_aggs_and_cols
     def extend_cpu(
             sx, tx, sy, ty, xmin, xmax, ymin, ymax,
@@ -1435,7 +1336,7 @@ def _build_extend_area_to_zero_axis0(
 def _build_extend_area_to_line_axis0(
         draw_trapezoid_y, expand_aggs_and_cols
 ):
-    @ngjit
+    @ngjit_no_cache
     @expand_aggs_and_cols
     def perform_extend(i, sx, tx, sy, ty, xmin, xmax, ymin, ymax, plot_start,
                        xs, ys0, ys1, *aggs_and_cols):
@@ -1456,7 +1357,7 @@ def _build_extend_area_to_line_axis0(
             *aggs_and_cols
         )
 
-    @ngjit
+    @ngjit_no_cache
     @expand_aggs_and_cols
     def extend_cpu(
             sx, tx, sy, ty, xmin, xmax, ymin, ymax,
@@ -1490,7 +1391,7 @@ def _build_extend_area_to_line_axis0(
 def _build_extend_area_to_zero_axis0_multi(
         draw_trapezoid_y, expand_aggs_and_cols
 ):
-    @ngjit
+    @ngjit_no_cache
     @expand_aggs_and_cols
     def perform_extend(i, j, sx, tx, sy, ty, xmin, xmax, ymin, ymax,
                        plot_start, xs, ys, *aggs_and_cols):
@@ -1510,7 +1411,7 @@ def _build_extend_area_to_zero_axis0_multi(
             *aggs_and_cols
         )
 
-    @ngjit
+    @ngjit_no_cache
     @expand_aggs_and_cols
     def extend_cpu(
             sx, tx, sy, ty, xmin, xmax, ymin, ymax,
@@ -1544,7 +1445,7 @@ def _build_extend_area_to_zero_axis0_multi(
 def _build_extend_area_to_line_axis0_multi(
         draw_trapezoid_y, expand_aggs_and_cols
 ):
-    @ngjit
+    @ngjit_no_cache
     @expand_aggs_and_cols
     def perform_extend(i, j, sx, tx, sy, ty, xmin, xmax, ymin, ymax,
                        plot_start, xs, ys0, ys1, *aggs_and_cols):
@@ -1565,7 +1466,7 @@ def _build_extend_area_to_line_axis0_multi(
             *aggs_and_cols
         )
 
-    @ngjit
+    @ngjit_no_cache
     @expand_aggs_and_cols
     def extend_cpu(
             sx, tx, sy, ty, xmin, xmax, ymin, ymax,
@@ -1600,7 +1501,7 @@ def _build_extend_area_to_line_axis0_multi(
 def _build_extend_area_to_zero_axis1_none_constant(
         draw_trapezoid_y, expand_aggs_and_cols
 ):
-    @ngjit
+    @ngjit_no_cache
     @expand_aggs_and_cols
     def perform_extend(
             i, j, sx, tx, sy, ty, xmin, xmax, ymin, ymax,
@@ -1623,7 +1524,7 @@ def _build_extend_area_to_zero_axis1_none_constant(
             x0, x1, y0, y1, y2, y3, trapezoid_start, stacked, *aggs_and_cols
         )
 
-    @ngjit
+    @ngjit_no_cache
     @expand_aggs_and_cols
     def extend_cpu(
             sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys, *aggs_and_cols
@@ -1654,7 +1555,7 @@ def _build_extend_area_to_zero_axis1_none_constant(
 def _build_extend_area_to_line_axis1_none_constant(
         draw_trapezoid_y, expand_aggs_and_cols
 ):
-    @ngjit
+    @ngjit_no_cache
     @expand_aggs_and_cols
     def perform_extend(
             i, j, sx, tx, sy, ty, xmin, xmax, ymin, ymax,
@@ -1679,7 +1580,7 @@ def _build_extend_area_to_line_axis1_none_constant(
             *aggs_and_cols
         )
 
-    @ngjit
+    @ngjit_no_cache
     @expand_aggs_and_cols
     def extend_cpu(
             sx, tx, sy, ty, xmin, xmax, ymin, ymax,
@@ -1714,7 +1615,7 @@ def _build_extend_area_to_line_axis1_none_constant(
 def _build_extend_area_to_zero_axis1_x_constant(
         draw_trapezoid_y, expand_aggs_and_cols
 ):
-    @ngjit
+    @ngjit_no_cache
     @expand_aggs_and_cols
     def perform_extend(i, j, sx, tx, sy, ty, xmin, xmax, ymin, ymax,
                        xs, ys, *aggs_and_cols):
@@ -1737,7 +1638,7 @@ def _build_extend_area_to_zero_axis1_x_constant(
             *aggs_and_cols
         )
 
-    @ngjit
+    @ngjit_no_cache
     @expand_aggs_and_cols
     def extend_cpu(
             sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys, *aggs_and_cols
@@ -1768,7 +1669,7 @@ def _build_extend_area_to_zero_axis1_x_constant(
 def _build_extend_area_to_line_axis1_x_constant(
         draw_trapezoid_y, expand_aggs_and_cols
 ):
-    @ngjit
+    @ngjit_no_cache
     @expand_aggs_and_cols
     def perform_extend(
             i, j, sx, tx, sy, ty, xmin, xmax, ymin, ymax,
@@ -1792,7 +1693,7 @@ def _build_extend_area_to_line_axis1_x_constant(
             x0, x1, y0, y1, y2, y3, trapezoid_start, stacked, *aggs_and_cols
         )
 
-    @ngjit
+    @ngjit_no_cache
     @expand_aggs_and_cols
     def extend_cpu(
             sx, tx, sy, ty, xmin, xmax, ymin, ymax,
@@ -1825,7 +1726,7 @@ def _build_extend_area_to_line_axis1_x_constant(
 def _build_extend_area_to_zero_axis1_y_constant(
         draw_trapezoid_y, expand_aggs_and_cols
 ):
-    @ngjit
+    @ngjit_no_cache
     @expand_aggs_and_cols
     def perform_extend(
             i, j, sx, tx, sy, ty, xmin, xmax, ymin, ymax,
@@ -1849,7 +1750,7 @@ def _build_extend_area_to_zero_axis1_y_constant(
             *aggs_and_cols
         )
 
-    @ngjit
+    @ngjit_no_cache
     @expand_aggs_and_cols
     def extend_cpu(
             sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys, *aggs_and_cols
@@ -1880,7 +1781,7 @@ def _build_extend_area_to_zero_axis1_y_constant(
 def _build_extend_area_to_line_axis1_y_constant(
         draw_trapezoid_y, expand_aggs_and_cols
 ):
-    @ngjit
+    @ngjit_no_cache
     @expand_aggs_and_cols
     def perform_extend(
             i, j, sx, tx, sy, ty, xmin, xmax, ymin, ymax,
@@ -1906,7 +1807,7 @@ def _build_extend_area_to_line_axis1_y_constant(
         )
 
 
-    @ngjit
+    @ngjit_no_cache
     @expand_aggs_and_cols
     def extend_cpu(
             sx, tx, sy, ty, xmin, xmax, ymin, ymax,
@@ -1954,7 +1855,7 @@ def _build_extend_area_to_zero_axis1_ragged(
             *aggs_and_cols
         )
 
-    @ngjit
+    @ngjit_no_cache
     @expand_aggs_and_cols
     def perform_extend_area_to_zero_axis1_ragged(
             sx, tx, sy, ty, xmin, xmax, ymin, ymax,
@@ -2027,7 +1928,7 @@ def _build_extend_area_to_line_axis1_ragged(
             y0_start_inds, y0_flat, y1_start_inds, y1_flat,
             *aggs_and_cols)
 
-    @ngjit
+    @ngjit_no_cache
     @expand_aggs_and_cols
     def perform_extend_area_to_line_axis1_ragged(
             sx, tx, sy, ty, xmin, xmax, ymin, ymax,
