@@ -103,6 +103,11 @@ def _cache_emit_njit(func_name: str, lines: list[str], cache_key_parts: list, *,
             setattr(module, name, obj)
 
     func = getattr(module, func_name)
+    # Expose a stable spec key for downstream cache dependencies
+    try:
+        setattr(func, "__ds_spec_key__", key)
+    except Exception:
+        pass
 
     # Instrument cache load/save to accurately reflect compile vs load events
     try:

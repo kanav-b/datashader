@@ -466,19 +466,110 @@ def _line_internal_build_extend(
     overwrite, use_2_stage_agg = two_stage_agg(antialias_stage_2)
     if not use_2_stage_agg:
         antialias_stage_2_funcs = None
-    draw_segment = _build_draw_segment(
-        append, map_onto_pixel, expand_aggs_and_cols, line_width, overwrite,
+    draw_segment = _build_draw_segment_generated(
+        append, x_mapper, y_mapper, map_onto_pixel, expand_aggs_and_cols, line_width, overwrite,
     )
     return draw_segment, antialias_stage_2_funcs
 
 
-# --- Simplified draw_segment function ---
-def _build_draw_segment(append, map_onto_pixel, expand_aggs_and_cols, line_width, overwrite):
-    """
-    Build the draw_segment function with simplified caching.
-    """
-    # Use the existing draw_line_segment function directly
-    return draw_line_segment
+def _build_draw_segment_generated(append, x_mapper, y_mapper, map_onto_pixel, expand_aggs_and_cols, line_width, overwrite):
+    """Build a cacheable draw_segment specialized by AA and mappers."""
+    antialias = line_width > 0.0
+
+    # Prepare fixed args for aggs_and_cols
+    n_extra = _infer_aggs_cols_len(expand_aggs_and_cols)
+    arg_names = [f"_{i}" for i in range(n_extra)]
+    args_join = ", ".join(arg_names)
+
+    header = (
+        "def draw_segment(i, sx, tx, sy, ty, xmin, xmax, ymin, ymax, "
+        "segment_start, segment_end, x0, x1, y0, y1, xm, ym, buffer, " + args_join + "):"
+    )
+
+    # Build stable identifiers for mapper implementations to avoid reusing
+    # a compiled draw_segment across different axis types (e.g. linear/log).
+    try:
+        xm_id = getattr(x_mapper, 'py_func', x_mapper).__code__.co_code.hex()[:16]
+    except Exception:
+        xm_id = repr(x_mapper)[:32]
+    try:
+        ym_id = getattr(y_mapper, 'py_func', y_mapper).__code__.co_code.hex()[:16]
+    except Exception:
+        ym_id = repr(y_mapper)[:32]
+
+    if antialias:
+        body = [
+            "    skip = False",
+            "    if isnull(x0) or isnull(y0) or isnull(x1) or isnull(y1):",
+            "        skip = True",
+            "    x0_1, x1_1, y0_1, y1_1, skip, clipped_start, clipped_end = _liang_barsky(xmin, xmax, ymin, ymax, x0, x1, y0, y1, skip)",
+            "    if skip:",
+            "        return",
+            "    segment_start = segment_start or clipped_start",
+            "    # Map to pixel space using provided mapper",
+            "    xx0, yy0 = map_onto_pixel(sx, tx, sy, ty, xmin, xmax, ymin, ymax, x0_1, y0_1)",
+            "    xx1, yy1 = map_onto_pixel(sx, tx, sy, ty, xmin, xmax, ymin, ymax, x1_1, y1_1)",
+            "    if segment_start:",
+            "        xm2 = 0.0; ym2 = 0.0",
+            "    else:",
+            "        xm2, ym2 = map_onto_pixel(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xm, ym)",
+            "    nx = round((xmax - xmin) * sx)",
+            "    ny = round((ymax - ymin) * sy)",
+            f"    _full_aa(LINE_WIDTH, OVERWRITE, i, xx0, xx1, yy0, yy1, segment_start, segment_end, xm2, ym2, nx, ny, {args_join})",
+        ]
+        spec_parts = [
+            "draw_segment",
+            ("n_extra", n_extra),
+            ("aa", True),
+            ("ow", bool(overwrite)),
+            ("xm", xm_id),
+            ("ym", ym_id),
+        ]
+        bindings = {
+            "x_mapper": x_mapper,
+            "y_mapper": y_mapper,
+            "map_onto_pixel": map_onto_pixel,
+            "_liang_barsky": _liang_barsky,
+            "isnull": isnull,
+            "_full_aa": _build_full_antialias(expand_aggs_and_cols, append),
+            "LINE_WIDTH": float(line_width),
+            "OVERWRITE": bool(overwrite),
+        }
+    else:
+        body = [
+            "    skip = False",
+            "    if isnull(x0) or isnull(y0) or isnull(x1) or isnull(y1):",
+            "        skip = True",
+            "    x0_1, x1_1, y0_1, y1_1, skip, clipped_start, clipped_end = _liang_barsky(xmin, xmax, ymin, ymax, x0, x1, y0, y1, skip)",
+            "    if skip:",
+            "        return",
+            "    clipped = clipped_start or clipped_end",
+            "    segment_start = segment_start or clipped_start",
+            "    xx0, yy0 = map_onto_pixel(sx, tx, sy, ty, xmin, xmax, ymin, ymax, x0_1, y0_1)",
+            "    xx1, yy1 = map_onto_pixel(sx, tx, sy, ty, xmin, xmax, ymin, ymax, x1_1, y1_1)",
+            f"    _bresenham(i, sx, tx, sy, ty, xmin, xmax, ymin, ymax, segment_start, xx0, xx1, yy0, yy1, clipped, {args_join})",
+        ]
+        spec_parts = [
+            "draw_segment",
+            ("n_extra", n_extra),
+            ("aa", False),
+            ("xm", xm_id),
+            ("ym", ym_id),
+        ]
+        bindings = {
+            "x_mapper": x_mapper,
+            "y_mapper": y_mapper,
+            "map_onto_pixel": map_onto_pixel,
+            "_liang_barsky": _liang_barsky,
+            "isnull": isnull,
+            "_bresenham": _build_bresenham(expand_aggs_and_cols, append),
+        }
+
+    # Emit the cacheable draw_segment
+    draw = _cache_emit_njit(
+        "draw_segment", [header] + body, spec_parts, bindings=bindings,
+    )
+    return draw
 
 
 class LineAxis0(_PointLike, _AntiAliasedLine):
@@ -866,10 +957,16 @@ class LinesAxis1XConstant(LinesAxis1):
     def _internal_build_extend(
             self, x_mapper, y_mapper, info, append, line_width, antialias_stage_2,
             antialias_stage_2_funcs):
-        
-        print(f'in _internal_build_extend for LinesAxis1XConstant - NEW STATIC ARCHITECTURE (line_width={line_width})')
-        
-        # NEW ARCHITECTURE: Use static functions directly, bypass dynamic infrastructure
+        # Use the same cached dynamic pipeline as other line variants
+        expand_aggs_and_cols = self.expand_aggs_and_cols(append)
+        draw_segment, antialias_stage_2_funcs = _line_internal_build_extend(
+            x_mapper, y_mapper, append, line_width, antialias_stage_2,
+            antialias_stage_2_funcs, expand_aggs_and_cols,
+        )
+        extend_cpu, extend_cuda = _build_extend_line_axis1_x_constant(
+            draw_segment, expand_aggs_and_cols, antialias_stage_2_funcs,
+        )
+
         x_values = self.x
         y_names = self.y
 
@@ -878,30 +975,15 @@ class LinesAxis1XConstant(LinesAxis1):
             xmin, xmax, ymin, ymax = bounds
             aggs_and_cols = aggs + info(df, aggs[0].shape[:2])
 
-            print(f'in extend for LinesAxis1XConstant - NEW STATIC ARCHITECTURE (line_width={line_width})')
-
             if cudf and isinstance(df, cudf.DataFrame):
                 xs = cp.asarray(x_values)
                 ys = self.to_cupy_array(df, y_names)
-                # TODO: Add CUDA support for new architecture
                 do_extend = extend_cuda[cuda_args(ys.shape)]
+                do_extend(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys, antialias_stage_2, *aggs_and_cols)
             else:
                 xs = x_values
                 ys = df.loc[:, list(y_names)].to_numpy()
-                
-                # NEW ARCHITECTURE: Call static function directly for each line
-                if len(aggs_and_cols) > 0:
-                    agg = aggs_and_cols[0]
-                    # Process each line separately with line_width support
-                    for i in range(len(ys)):
-                        x_line = xs
-                        y_line = ys[i]
-                        process_line_data(
-                            x_line, y_line,
-                            sx, tx, sy, ty,
-                            xmin, xmax, ymin, ymax,
-                            agg, line_width,
-                        )
+                extend_cpu(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys, antialias_stage_2, *aggs_and_cols)
 
         return extend
 
@@ -947,7 +1029,15 @@ class LinesAxis1YConstant(LinesAxis1):
     def _internal_build_extend(
             self, x_mapper, y_mapper, info, append, line_width, antialias_stage_2,
             antialias_stage_2_funcs):
-        print(f'in _internal_build_extend for LinesAxis1YConstant - NEW STATIC ARCHITECTURE (line_width={line_width})')
+        # Use the same cached dynamic pipeline with swapped dims
+        expand_aggs_and_cols = self.expand_aggs_and_cols(append)
+        draw_segment, antialias_stage_2_funcs = _line_internal_build_extend(
+            x_mapper, y_mapper, append, line_width, antialias_stage_2,
+            antialias_stage_2_funcs, expand_aggs_and_cols,
+        )
+        extend_cpu, extend_cuda = _build_extend_line_axis1_y_constant(
+            draw_segment, expand_aggs_and_cols, antialias_stage_2_funcs,
+        )
 
         x_names = self.x
         y_values = self.y
@@ -957,27 +1047,16 @@ class LinesAxis1YConstant(LinesAxis1):
             xmin, xmax, ymin, ymax = bounds
             aggs_and_cols = aggs + info(df, aggs[0].shape[:2])
 
-            print(f'in extend for LinesAxis1YConstant - NEW STATIC ARCHITECTURE (line_width={line_width})')
-
             if cudf and isinstance(df, cudf.DataFrame):
                 xs = self.to_cupy_array(df, x_names)
                 ys = cp.asarray(y_values)
-                # TODO: CUDA path for new architecture
+                if extend_cuda is not None:
+                    do_extend = extend_cuda[cuda_args(xs.shape)]
+                    do_extend(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys, antialias_stage_2, *aggs_and_cols)
             else:
                 xs = df.loc[:, list(x_names)].to_numpy()
                 ys = y_values
-
-                if len(aggs_and_cols) > 0:
-                    agg = aggs_and_cols[0]
-                    for i in range(len(xs)):
-                        x_line = xs[i]
-                        y_line = ys
-                        process_line_data(
-                            x_line, y_line,
-                            sx, tx, sy, ty,
-                            xmin, xmax, ymin, ymax,
-                            agg, line_width,
-                        )
+                extend_cpu(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys, antialias_stage_2, *aggs_and_cols)
 
         return extend
 
@@ -1214,49 +1293,58 @@ class LinesXarrayCommonX(LinesAxis1):
 
 
 def _build_map_onto_pixel_for_line(x_mapper, y_mapper, want_antialias=False):
-    @ngjit_no_cache
-    def map_onto_pixel_snap(sx, tx, sy, ty, xmin, xmax, ymin, ymax, x, y):
-        """Map points onto pixel grid.
-
-        Points falling on upper bound are mapped into previous bin.
-
-        If the line has been clipped, x and y will have been
-        computed to lie on the bounds; we compare point and bounds
-        in integer space to avoid fp error. In contrast, with
-        auto-ranging, a point on the bounds will be the same
-        floating point number as the bound, so comparison in fp
-        representation of continuous space or in integer space
-        doesn't change anything.
-        """
-        xx = int(x_mapper(x) * sx + tx)
-        yy = int(y_mapper(y) * sy + ty)
-
-        # Note that sx and tx were designed so that
-        # x_mapper(xmax) * sx + tx equals the width of the canvas in pixels
-        #
-        # Likewise, sy and ty were designed so that
-        # y_mapper(ymax) * sy + ty equals the height of the canvas in pixels
-        #
-        # We round these results to integers (rather than casting to integers
-        # with the int constructor) to handle cases where floating-point
-        # precision errors results in a value just under the integer number
-        # of pixels.
-        xxmax = round(x_mapper(xmax) * sx + tx)
-        yymax = round(y_mapper(ymax) * sy + ty)
-
-        return (xx - 1 if xx == xxmax else xx,
-                yy - 1 if yy == yymax else yy)
-
-    @ngjit_no_cache
-    def map_onto_pixel_no_snap(sx, tx, sy, ty, xmin, xmax, ymin, ymax, x, y):
-        xx = x_mapper(x)*sx + tx - 0.5
-        yy = y_mapper(y)*sy + ty - 0.5
-        return xx, yy
+    """Return a cacheable map_onto_pixel specialized to axis mappers + AA mode."""
+    # Build stable identifiers for mapper implementations for cache keying
+    try:
+        xm_id = getattr(x_mapper, 'py_func', x_mapper).__code__.co_code.hex()[:16]
+    except Exception:
+        xm_id = repr(x_mapper)[:32]
+    try:
+        ym_id = getattr(y_mapper, 'py_func', y_mapper).__code__.co_code.hex()[:16]
+    except Exception:
+        ym_id = repr(y_mapper)[:32]
 
     if want_antialias:
-        return map_onto_pixel_no_snap
+        header = (
+            "def map_onto_pixel(sx, tx, sy, ty, xmin, xmax, ymin, ymax, x, y):"
+        )
+        body = [
+            "    xx = x_mapper(x) * sx + tx - 0.5",
+            "    yy = y_mapper(y) * sy + ty - 0.5",
+            "    return xx, yy",
+        ]
+        spec_parts = [
+            "map_onto_pixel",
+            ("aa", True),
+            ("xm", xm_id),
+            ("ym", ym_id),
+        ]
+        bindings = {"x_mapper": x_mapper, "y_mapper": y_mapper}
     else:
-        return map_onto_pixel_snap
+        header = (
+            "def map_onto_pixel(sx, tx, sy, ty, xmin, xmax, ymin, ymax, x, y):"
+        )
+        body = [
+            "    xx = int(x_mapper(x) * sx + tx)",
+            "    yy = int(y_mapper(y) * sy + ty)",
+            "    xxmax = round(x_mapper(xmax) * sx + tx)",
+            "    yymax = round(y_mapper(ymax) * sy + ty)",
+            "    if xx == xxmax: xx -= 1",
+            "    if yy == yymax: yy -= 1",
+            "    return xx, yy",
+        ]
+        spec_parts = [
+            "map_onto_pixel",
+            ("aa", False),
+            ("xm", xm_id),
+            ("ym", ym_id),
+        ]
+        bindings = {"x_mapper": x_mapper, "y_mapper": y_mapper}
+
+    mapper_fn = _cache_emit_njit(
+        "map_onto_pixel", [header] + body, spec_parts, bindings=bindings,
+    )
+    return mapper_fn
 
 
 @ngjit
@@ -1559,113 +1647,79 @@ def _build_bresenham(expand_aggs_and_cols, append):
 # try moving the ngjit and expanf aggs and cols decorator to the this top level and see if it works
 
 def _build_draw_segment(append, map_onto_pixel, expand_aggs_and_cols, line_width, overwrite):
-    """Specialize a line plotting kernel for a given append/axis combination"""
-
-    if line_width > 0.0:
-        _bresenham = None
-        _full_antialias = _build_full_antialias(expand_aggs_and_cols, append)
-    else:
-        _bresenham = _build_bresenham(expand_aggs_and_cols, append)
-        _full_antialias = None
-
-    @ngjit_no_cache
-    @expand_aggs_and_cols
-    def draw_segment(
-            i, sx, tx, sy, ty, xmin, xmax, ymin, ymax, segment_start, segment_end,
-            x0, x1, y0, y1, xm, ym, buffer, *aggs_and_cols,
-            # append=append, 
-            # map_onto_pixel=map_onto_pixel, overwrite=overwrite, line_width=line_width, 
-            # _bresenham=_bresenham, _full_antialias=_full_antialias
-    ):
-        # xm, ym are only valid if segment_start is True.
-
-        # buffer is a length-8 float64 array if antialiasing is to be used,
-        # or None otherwise. It is allocated in the appropriate extend_cpu or
-        # extend_cuda function so that it is of the correct type (numpy or
-        # cupy) and that there is one per CPU/GPU thread.
-
-        # NOTE: The slightly bizarre variable versioning herein for variables
-        # x0, y0, y0, y1 is to deal with Numba not having SSA form prior to
-        # version 0.49.0. The result of lack of SSA is that the type inference
-        # algorithms would widen types that are multiply defined as would be the
-        # case in code such as `x, y = function(x, y)` if the function returned
-        # a wider type for x, y then the input x, y.
-        skip = False
-
-        # If any of the coordinates are NaN, there's a discontinuity.
-        # Skip the entire segment.
-        if isnull(x0) or isnull(y0) or isnull(x1) or isnull(y1):
-            skip = True
-        # Use Liang-Barsky to clip the segment to a bounding box
-        x0_1, x1_1, y0_1, y1_1, skip, clipped_start, clipped_end = \
-            _liang_barsky(xmin, xmax, ymin, ymax, x0, x1, y0, y1, skip)
-
-        if not skip:
-            clipped = clipped_start or clipped_end
-            segment_start = segment_start or clipped_start
-            x0_2, y0_2 = map_onto_pixel(
-                sx, tx, sy, ty, xmin, xmax, ymin, ymax, x0_1, y0_1
-            )
-            x1_2, y1_2 = map_onto_pixel(
-                sx, tx, sy, ty, xmin, xmax, ymin, ymax, x1_1, y1_1
-            )
-            if line_width > 0.0:
-                if segment_start:
-                    xm_2 = ym_2 = 0.0
-                else:
-                    xm_2, ym_2 = map_onto_pixel(
-                        sx, tx, sy, ty, xmin, xmax, ymin, ymax, xm, ym)
-                nx = round((xmax - xmin)*sx)
-                ny = round((ymax - ymin)*sy)
-                _full_antialias(line_width, overwrite, i, x0_2, x1_2, y0_2, y1_2,
-                                segment_start, segment_end, xm_2, ym_2,
-                                nx, ny, *aggs_and_cols)
-            else:
-                _bresenham(i, sx, tx, sy, ty, xmin, xmax, ymin, ymax,
-                           segment_start, x0_2, x1_2, y0_2, y1_2,
-                           clipped, *aggs_and_cols)
-
-    return draw_segment
+    """Legacy shim. Replaced by the new cacheable draw_segment builder."""
+    raise RuntimeError("_build_draw_segment legacy overload should not be called")
 
 def _build_extend_line_axis0(draw_segment, expand_aggs_and_cols, antialias_stage_2_funcs):
     print('DEBUG: entering _build_extend_line_axis0')
     use_2_stage_agg = antialias_stage_2_funcs is not None
 
-    @ngjit_no_cache
-    @expand_aggs_and_cols
-    def perform_extend_line(i, sx, tx, sy, ty, xmin, xmax, ymin, ymax,
-                            plot_start, xs, ys, buffer, *aggs_and_cols):
-        x0 = xs[i]
-        y0 = ys[i]
-        x1 = xs[i + 1]
-        y1 = ys[i + 1]
-        segment_start = (plot_start if i == 0 else
-                         (isnull(xs[i - 1]) or isnull(ys[i - 1])))
+    # Generate cacheable CPU extend kernels
+    n_extra = _infer_aggs_cols_len(expand_aggs_and_cols)
+    arg_names = [f"_{i}" for i in range(n_extra)]
+    args_join = ", ".join(arg_names)
 
-        segment_end = (i == len(xs)-2) or isnull(xs[i+2]) or isnull(ys[i+2])
+    # Use the generated function's spec key if available for stable cache keys
+    _ds_key = getattr(draw_segment, "__ds_spec_key__", None)
+    if _ds_key is None:
+        try:
+            _ds_key = draw_segment.py_func.__code__.co_code.hex()[:16]
+        except Exception:
+            _ds_key = repr(draw_segment)[:32]
 
-        if segment_start or use_2_stage_agg:
-            xm = 0.0
-            ym = 0.0
-        else:
-            xm = xs[i-1]
-            ym = ys[i-1]
+    header = (
+        "def extend_axis0(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys, plot_start, antialias_stage_2, " + args_join + "):"
+    )
+    body = [
+        "    antialias = antialias_stage_2 is not None",
+        "    buffer = np.empty(8) if antialias else None",
+        "    nrows = xs.shape[0]",
+        "    for i in range(nrows - 1):",
+        "        x0 = xs[i]; y0 = ys[i]; x1 = xs[i+1]; y1 = ys[i+1]",
+        "        segment_start = (plot_start if i == 0 else (isnull(xs[i-1]) or isnull(ys[i-1])))",
+        "        segment_end = (i == nrows-2) or isnull(xs[i+2]) or isnull(ys[i+2])",
+        "        if segment_start:",
+        "            xm = 0.0; ym = 0.0",
+        "        else:",
+        "            xm = xs[i-1]; ym = ys[i-1]",
+        f"        draw_segment(i, sx, tx, sy, ty, xmin, xmax, ymin, ymax, segment_start, segment_end, x0, x1, y0, y1, xm, ym, buffer, {args_join})",
+    ]
+    _extend_axis0 = _cache_emit_njit(
+        "extend_axis0", [header] + body,
+        ["extend_axis0", ("n_extra", n_extra), ("ds", _ds_key)],
+        bindings={"draw_segment": draw_segment, "isnull": isnull, "np": np},
+    )
 
-        draw_segment(i, sx, tx, sy, ty, xmin, xmax, ymin, ymax,
-                     segment_start, segment_end, x0, x1, y0, y1,
-                     xm, ym, buffer, *aggs_and_cols)
+    header2 = (
+        "def extend_axis0_aa2(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys, plot_start, antialias_stage_2, aggs_and_accums, " + args_join + "):"
+    )
+    body2 = [
+        "    antialias = antialias_stage_2 is not None",
+        "    buffer = np.empty(8) if antialias else None",
+        "    nrows = xs.shape[0]",
+        "    for i in range(nrows - 1):",
+        "        x0 = xs[i]; y0 = ys[i]; x1 = xs[i+1]; y1 = ys[i+1]",
+        "        segment_start = (plot_start if i == 0 else (isnull(xs[i-1]) or isnull(ys[i-1])))",
+        "        segment_end = (i == nrows-2) or isnull(xs[i+2]) or isnull(ys[i+2])",
+        f"        draw_segment(i, sx, tx, sy, ty, xmin, xmax, ymin, ymax, segment_start, segment_end, x0, x1, y0, y1, 0.0, 0.0, buffer, {args_join})",
+        "    aa_stage_2_accumulate(aggs_and_accums, True)",
+        "    aa_stage_2_copy_back(aggs_and_accums)",
+    ]
+    _extend_axis0_aa2 = _cache_emit_njit(
+        "extend_axis0_aa2", [header2] + body2,
+        ["extend_axis0_aa2", ("n_extra", n_extra), ("ds", _ds_key)],
+        bindings={
+            "draw_segment": draw_segment,
+            "isnull": isnull,
+            "np": np,
+            "aa_stage_2_accumulate": antialias_stage_2_funcs[0] if use_2_stage_agg else None,
+            "aa_stage_2_copy_back": antialias_stage_2_funcs[2] if use_2_stage_agg else None,
+        },
+    )
 
-    @ngjit_no_cache
-    @expand_aggs_and_cols
     def extend_cpu(sx, tx, sy, ty, xmin, xmax, ymin, ymax,
                    xs, ys, plot_start, antialias_stage_2, *aggs_and_cols):
-        """Aggregate along a line formed by ``xs`` and ``ys``"""
-        antialias = antialias_stage_2 is not None
-        buffer = np.empty(8) if antialias else None
-        nrows = xs.shape[0]
-        for i in range(nrows - 1):
-            perform_extend_line(i, sx, tx, sy, ty, xmin, xmax, ymin, ymax,
-                                plot_start, xs, ys, buffer, *aggs_and_cols)
+        _extend_axis0(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys, plot_start, antialias_stage_2, *aggs_and_cols)
 
     @cuda.jit
     @expand_aggs_and_cols
@@ -1686,74 +1740,84 @@ def _build_extend_line_axis0_multi(draw_segment, expand_aggs_and_cols, antialias
         aa_stage_2_accumulate, aa_stage_2_clear, aa_stage_2_copy_back = antialias_stage_2_funcs
     use_2_stage_agg = antialias_stage_2_funcs is not None
 
-    @ngjit_no_cache
-    @expand_aggs_and_cols
-    def perform_extend_line(i, j, sx, tx, sy, ty, xmin, xmax, ymin, ymax,
-                            plot_start, xs, ys, buffer, *aggs_and_cols):
-        x0 = xs[i, j]
-        y0 = ys[i, j]
-        x1 = xs[i + 1, j]
-        y1 = ys[i + 1, j]
-        segment_start = (plot_start if i == 0 else
-                         (isnull(xs[i - 1, j]) or isnull(ys[i - 1, j])))
+    # Generate cacheable CPU extend kernels for axis0_multi
+    n_extra = _infer_aggs_cols_len(expand_aggs_and_cols)
+    _ds_key = getattr(draw_segment, "__ds_spec_key__", None)
+    if _ds_key is None:
+        try:
+            _ds_key = draw_segment.py_func.__code__.co_code.hex()[:16]
+        except Exception:
+            _ds_key = repr(draw_segment)[:32]
+    arg_names = [f"_{i}" for i in range(n_extra)]
+    args_join = ", ".join(arg_names)
+    header = (
+        "def extend_axis0_multi(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys, plot_start, antialias_stage_2, " + args_join + "):"
+    )
+    body = [
+        "    antialias = antialias_stage_2 is not None",
+        "    buffer = np.empty(8) if antialias else None",
+        "    nrows, ncols = xs.shape",
+        "    for j in range(ncols):",
+        "        for i in range(nrows - 1):",
+        "            x0 = xs[i, j]; y0 = ys[i, j]; x1 = xs[i+1, j]; y1 = ys[i+1, j]",
+        "            segment_start = (plot_start if i == 0 else (isnull(xs[i-1, j]) or isnull(ys[i-1, j])))",
+        "            segment_end = (i == nrows-2) or isnull(xs[i+2, j]) or isnull(ys[i+2, j])",
+        "            if segment_start:",
+        "                xm = 0.0; ym = 0.0",
+        "            else:",
+        "                xm = xs[i-1, j]; ym = ys[i-1, j]",
+        f"            draw_segment(i, sx, tx, sy, ty, xmin, xmax, ymin, ymax, segment_start, segment_end, x0, x1, y0, y1, xm, ym, buffer, {args_join})",
+    ]
+    _extend_axis0_multi = _cache_emit_njit(
+        "extend_axis0_multi", [header] + body,
+        ["extend_axis0_multi", ("n_extra", n_extra), ("ds", _ds_key)],
+        bindings={"draw_segment": draw_segment, "isnull": isnull, "np": np},
+    )
 
-        segment_end = (i == len(xs)-2) or isnull(xs[i+2, j]) or isnull(ys[i+2, j])
-
-        if segment_start or use_2_stage_agg:
-            xm = 0.0
-            ym = 0.0
-        else:
-            xm = xs[i-1, j]
-            ym = ys[i-1, j]
-
-        draw_segment(i, sx, tx, sy, ty, xmin, xmax, ymin, ymax,
-                     segment_start, segment_end, x0, x1, y0, y1,
-                     xm, ym, buffer, *aggs_and_cols)
-
-    @ngjit_no_cache
-    @expand_aggs_and_cols
     def extend_cpu(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys,
                    plot_start, antialias_stage_2, *aggs_and_cols):
-        """Aggregate along a line formed by ``xs`` and ``ys``"""
-        antialias = antialias_stage_2 is not None
-        buffer = np.empty(8) if antialias else None
-        nrows, ncols = xs.shape
+        _extend_axis0_multi(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys, plot_start, antialias_stage_2, *aggs_and_cols)
 
-        for j in range(ncols):
-            for i in range(nrows - 1):
-                perform_extend_line(i, j, sx, tx, sy, ty, xmin, xmax, ymin, ymax,
-                                    plot_start, xs, ys, buffer, *aggs_and_cols)
+    # AA2 path: generate cacheable implementation
+    header2 = (
+        "def extend_axis0_multi_aa2(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys, plot_start, antialias_stage_2, aggs_and_accums, " + args_join + "):"
+    )
+    body2 = [
+        "    antialias = antialias_stage_2 is not None",
+        "    buffer = np.empty(8) if antialias else None",
+        "    nrows, ncols = xs.shape",
+        "    for j in range(ncols):",
+        "        for i in range(nrows - 1):",
+        "            x0 = xs[i, j]; y0 = ys[i, j]; x1 = xs[i+1, j]; y1 = ys[i+1, j]",
+        "            segment_start = (plot_start if i == 0 else (isnull(xs[i-1, j]) or isnull(ys[i-1, j])))",
+        "            segment_end = (i == nrows-2) or isnull(xs[i+2, j]) or isnull(ys[i+2, j])",
+        f"            draw_segment(i, sx, tx, sy, ty, xmin, xmax, ymin, ymax, segment_start, segment_end, x0, x1, y0, y1, 0.0, 0.0, buffer, {args_join})",
+        "        if ncols == 1:",
+        "            aa_stage_2_copy_back(aggs_and_accums)",
+        "            return",
+        "        aa_stage_2_accumulate(aggs_and_accums, j==0)",
+        "        if j < ncols - 1:",
+        "            aa_stage_2_clear(aggs_and_accums)",
+        "    aa_stage_2_copy_back(aggs_and_accums)",
+    ]
+    _extend_axis0_multi_aa2 = _cache_emit_njit(
+        "extend_axis0_multi_aa2", [header2] + body2,
+        ["extend_axis0_multi_aa2", ("n_extra", n_extra), ("ds", _ds_key)],
+        bindings={
+            "draw_segment": draw_segment,
+            "isnull": isnull,
+            "np": np,
+            "aa_stage_2_accumulate": aa_stage_2_accumulate if use_2_stage_agg else None,
+            "aa_stage_2_clear": aa_stage_2_clear if use_2_stage_agg else None,
+            "aa_stage_2_copy_back": aa_stage_2_copy_back if use_2_stage_agg else None,
+        },
+    )
 
     def extend_cpu_antialias_2agg(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys,
                                   plot_start, antialias_stage_2, *aggs_and_cols):
-        """Aggregate along a line formed by ``xs`` and ``ys``"""
         n_aggs = len(antialias_stage_2[0])
         aggs_and_accums = tuple((agg, agg.copy()) for agg in aggs_and_cols[:n_aggs])
-        cpu_antialias_2agg_impl(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys,
-                                plot_start, antialias_stage_2, aggs_and_accums, *aggs_and_cols)
-
-    @ngjit_no_cache
-    @expand_aggs_and_cols
-    def cpu_antialias_2agg_impl(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys,
-                                plot_start, antialias_stage_2, aggs_and_accums, *aggs_and_cols):
-        antialias = antialias_stage_2 is not None
-        buffer = np.empty(8) if antialias else None
-
-        nrows, ncols = xs.shape
-        for j in range(ncols):
-            for i in range(nrows - 1):
-                perform_extend_line(i, j, sx, tx, sy, ty, xmin, xmax, ymin, ymax,
-                                    plot_start, xs, ys, buffer, *aggs_and_cols)
-
-            if ncols == 1:
-                return
-
-            aa_stage_2_accumulate(aggs_and_accums, j==0)
-
-            if j < ncols - 1:
-                aa_stage_2_clear(aggs_and_accums)
-
-        aa_stage_2_copy_back(aggs_and_accums)
+        _extend_axis0_multi_aa2(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys, plot_start, antialias_stage_2, aggs_and_accums, *aggs_and_cols)
 
 
     @cuda.jit
@@ -1779,76 +1843,83 @@ def _build_extend_line_axis1_none_constant(draw_segment, expand_aggs_and_cols,
         aa_stage_2_accumulate, aa_stage_2_clear, aa_stage_2_copy_back = antialias_stage_2_funcs
     use_2_stage_agg = antialias_stage_2_funcs is not None
 
-    @ngjit_no_cache
-    @expand_aggs_and_cols
-    def perform_extend_line(
-            i, j, sx, tx, sy, ty, xmin, xmax, ymin, ymax,
-            xs, ys, buffer, *aggs_and_cols
-    ):
-        x0 = xs[i, j]
-        y0 = ys[i, j]
-        x1 = xs[i, j + 1]
-        y1 = ys[i, j + 1]
-        segment_start = (
-                (j == 0) or isnull(xs[i, j - 1]) or isnull(ys[i, j - 1])
-        )
+    # Generate cacheable CPU extend kernels for axis1 (none constant)
+    n_extra = _infer_aggs_cols_len(expand_aggs_and_cols)
+    _ds_key = getattr(draw_segment, "__ds_spec_key__", None)
+    if _ds_key is None:
+        try:
+            _ds_key = draw_segment.py_func.__code__.co_code.hex()[:16]
+        except Exception:
+            _ds_key = repr(draw_segment)[:32]
+    arg_names = [f"_{i}" for i in range(n_extra)]
+    args_join = ", ".join(arg_names)
+    header = (
+        "def extend_axis1_none(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys, antialias_stage_2, " + args_join + "):"
+    )
+    body = [
+        "    antialias = antialias_stage_2 is not None",
+        "    buffer = np.empty(8) if antialias else None",
+        "    nrows, ncols = xs.shape",
+        "    for i in range(nrows):",
+        "        for j in range(ncols - 1):",
+        "            x0 = xs[i, j]; y0 = ys[i, j]; x1 = xs[i, j+1]; y1 = ys[i, j+1]",
+        "            segment_start = (j == 0) or isnull(xs[i, j-1]) or isnull(ys[i, j-1])",
+        "            segment_end = (j == ncols-2) or isnull(xs[i, j+2]) or isnull(ys[i, j+2])",
+        "            if segment_start:",
+        "                xm = 0.0; ym = 0.0",
+        "            else:",
+        "                xm = xs[i, j-1]; ym = ys[i, j-1]",
+        f"            draw_segment(i, sx, tx, sy, ty, xmin, xmax, ymin, ymax, segment_start, segment_end, x0, x1, y0, y1, xm, ym, buffer, {args_join})",
+    ]
+    _extend_axis1_none = _cache_emit_njit(
+        "extend_axis1_none", [header] + body,
+        ["extend_axis1_none", ("n_extra", n_extra), ("ds", _ds_key)],
+        bindings={"draw_segment": draw_segment, "isnull": isnull, "np": np},
+    )
 
-        segment_end = (j == xs.shape[1]-2) or isnull(xs[i, j+2]) or isnull(ys[i, j+2])
-
-        if segment_start or use_2_stage_agg:
-            xm = 0.0
-            ym = 0.0
-        else:
-            xm = xs[i, j-1]
-            ym = ys[i, j-1]
-
-        draw_segment(i, sx, tx, sy, ty, xmin, xmax, ymin, ymax,
-                     segment_start, segment_end, x0, x1, y0, y1,
-                     xm, ym, buffer, *aggs_and_cols)
-
-    @ngjit_no_cache
-    @expand_aggs_and_cols
     def extend_cpu(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys, antialias_stage_2,
                    *aggs_and_cols):
-        antialias = antialias_stage_2 is not None
-        buffer = np.empty(8) if antialias else None
-        ncols = xs.shape[1]
-        for i in range(xs.shape[0]):
-            for j in range(ncols - 1):
-                perform_extend_line(
-                    i, j, sx, tx, sy, ty, xmin, xmax, ymin, ymax,
-                    xs, ys, buffer, *aggs_and_cols
-                )
+        _extend_axis1_none(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys, antialias_stage_2, *aggs_and_cols)
+
+    header2 = (
+        "def extend_axis1_none_aa2(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys, antialias_stage_2, aggs_and_accums, " + args_join + "):"
+    )
+    body2 = [
+        "    antialias = antialias_stage_2 is not None",
+        "    buffer = np.empty(8) if antialias else None",
+        "    nrows, ncols = xs.shape",
+        "    for i in range(nrows):",
+        "        for j in range(ncols - 1):",
+        "            x0 = xs[i, j]; y0 = ys[i, j]; x1 = xs[i, j+1]; y1 = ys[i, j+1]",
+        "            segment_start = (j == 0) or isnull(xs[i, j-1]) or isnull(ys[i, j-1])",
+        "            segment_end = (j == ncols-2) or isnull(xs[i, j+2]) or isnull(ys[i, j+2])",
+        f"            draw_segment(i, sx, tx, sy, ty, xmin, xmax, ymin, ymax, segment_start, segment_end, x0, x1, y0, y1, 0.0, 0.0, buffer, {args_join})",
+        "        if nrows == 1:",
+        "            aa_stage_2_copy_back(aggs_and_accums)",
+        "            return",
+        "        aa_stage_2_accumulate(aggs_and_accums, i==0)",
+        "        if i < nrows - 1:",
+        "            aa_stage_2_clear(aggs_and_accums)",
+        "    aa_stage_2_copy_back(aggs_and_accums)",
+    ]
+    _extend_axis1_none_aa2 = _cache_emit_njit(
+        "extend_axis1_none_aa2", [header2] + body2,
+        ["extend_axis1_none_aa2", ("n_extra", n_extra), ("ds", _ds_key)],
+        bindings={
+            "draw_segment": draw_segment,
+            "isnull": isnull,
+            "np": np,
+            "aa_stage_2_accumulate": aa_stage_2_accumulate if use_2_stage_agg else None,
+            "aa_stage_2_clear": aa_stage_2_clear if use_2_stage_agg else None,
+            "aa_stage_2_copy_back": aa_stage_2_copy_back if use_2_stage_agg else None,
+        },
+    )
 
     def extend_cpu_antialias_2agg(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys,
                                   antialias_stage_2, *aggs_and_cols):
         n_aggs = len(antialias_stage_2[0])
         aggs_and_accums = tuple((agg, agg.copy()) for agg in aggs_and_cols[:n_aggs])
-        cpu_antialias_2agg_impl(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys,
-                                antialias_stage_2, aggs_and_accums, *aggs_and_cols)
-
-    @ngjit_no_cache
-    @expand_aggs_and_cols
-    def cpu_antialias_2agg_impl(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys,
-                                antialias_stage_2, aggs_and_accums, *aggs_and_cols):
-        antialias = antialias_stage_2 is not None
-        buffer = np.empty(8) if antialias else None
-
-        ncols = xs.shape[1]
-        for i in range(xs.shape[0]):
-            for j in range(ncols - 1):
-                perform_extend_line(i, j, sx, tx, sy, ty, xmin, xmax, ymin, ymax,
-                                    xs, ys, buffer, *aggs_and_cols)
-
-            if xs.shape[0] == 1:
-                return
-
-            aa_stage_2_accumulate(aggs_and_accums, i==0)
-
-            if i < xs.shape[0] - 1:
-                aa_stage_2_clear(aggs_and_accums)
-
-        aa_stage_2_copy_back(aggs_and_accums)
+        _extend_axis1_none_aa2(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys, antialias_stage_2, aggs_and_accums, *aggs_and_cols)
 
     @cuda.jit
     @expand_aggs_and_cols
@@ -1875,97 +1946,104 @@ def _build_extend_line_axis1_x_constant(draw_segment, expand_aggs_and_cols,
         aa_stage_2_accumulate, aa_stage_2_clear, aa_stage_2_copy_back = antialias_stage_2_funcs
     use_2_stage_agg = antialias_stage_2_funcs is not None
 
-    @ngjit
-    @expand_aggs_and_cols
-    def perform_extend_line(
-            i, j, sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys, buffer, *aggs_and_cols
-    ):
-        x0 = xs[j]
-        x1 = xs[j + 1]
-        if swap_dims:
-            y0 = ys[j, i]
-            y1 = ys[j + 1, i]
-            segment_start = (j == 0) or isnull(xs[j - 1]) or isnull(ys[j - 1, i])
-            segment_end = (j == len(xs)-2) or isnull(xs[j+2]) or isnull(ys[j+2, i])
-        else:
-            y0 = ys[i, j]
-            y1 = ys[i, j + 1]
-            segment_start = (j == 0) or isnull(xs[j - 1]) or isnull(ys[i, j - 1])
-            segment_end = (j == len(xs)-2) or isnull(xs[j+2]) or isnull(ys[i, j+2])
+    # Generate cacheable CPU extend kernels for axis1 (x constant)
+    n_extra = _infer_aggs_cols_len(expand_aggs_and_cols)
+    _ds_key = getattr(draw_segment, "__ds_spec_key__", None)
+    if _ds_key is None:
+        try:
+            _ds_key = draw_segment.py_func.__code__.co_code.hex()[:16]
+        except Exception:
+            _ds_key = repr(draw_segment)[:32]
+    arg_names = [f"_{i}" for i in range(n_extra)]
+    args_join = ", ".join(arg_names)
 
-        if segment_start or use_2_stage_agg:
-            xm = 0.0
-            ym = 0.0
-        else:
-            xm = xs[j-1]
-            ym = ys[j-1, i] if swap_dims else ys[i, j-1]
+    header = (
+        "def extend_axis1_xconst(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys, antialias_stage_2, " + args_join + "):"
+    )
+    if swap_dims:
+        shape_def = "    ncols, nrows = ys.shape"
+        y0y1 = "y0 = ys[j, i]; y1 = ys[j + 1, i]"
+        seg_start = "segment_start = (j == 0) or isnull(xs[j - 1]) or isnull(ys[j - 1, i])"
+        seg_end = "segment_end = (j == len(xs)-2) or isnull(xs[j+2]) or isnull(ys[j+2, i])"
+        xm_ym = "xm = xs[j-1]; ym = ys[j-1, i]"
+    else:
+        shape_def = "    nrows, ncols = ys.shape"
+        y0y1 = "y0 = ys[i, j]; y1 = ys[i, j + 1]"
+        seg_start = "segment_start = (j == 0) or isnull(xs[j - 1]) or isnull(ys[i, j - 1])"
+        seg_end = "segment_end = (j == ncols-2) or isnull(xs[j+2]) or isnull(ys[i, j+2])"
+        xm_ym = "xm = xs[j-1]; ym = ys[i, j-1]"
 
-        draw_segment(i, sx, tx, sy, ty, xmin, xmax, ymin, ymax,
-                     segment_start, segment_end, x0, x1, y0, y1,
-                     xm, ym, buffer, *aggs_and_cols)
+    body = [
+        "    antialias = antialias_stage_2 is not None",
+        "    buffer = np.empty(8) if antialias else None",
+        shape_def,
+        "    for i in range(nrows):",
+        "        for j in range(ncols - 1):",
+        "            x0 = xs[j]; x1 = xs[j + 1]",
+        f"            {y0y1}",
+        f"            {seg_start}",
+        f"            {seg_end}",
+        "            if segment_start:",
+        "                xm = 0.0; ym = 0.0",
+        "            else:",
+        f"                {xm_ym}",
+        f"            draw_segment(i, sx, tx, sy, ty, xmin, xmax, ymin, ymax, segment_start, segment_end, x0, x1, y0, y1, xm, ym, buffer, {args_join})",
+    ]
+    _extend_axis1_xconst = _cache_emit_njit(
+        "extend_axis1_xconst", [header] + body,
+        ["extend_axis1_xconst", ("n_extra", n_extra), ("ds", _ds_key), ("sw", int(swap_dims))],
+        bindings={"draw_segment": draw_segment, "isnull": isnull, "np": np},
+    )
 
-    @ngjit
-    @expand_aggs_and_cols
     def extend_cpu(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys, antialias_stage_2,
                    *aggs_and_cols):
-        antialias = antialias_stage_2 is not None
-        buffer = np.empty(8) if antialias else None
-        ncols, nrows = ys.shape if swap_dims else ys.shape[::-1]
-        for i in range(nrows):
-            for j in range(ncols - 1):
-                perform_extend_line(
-                    i, j, sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys, buffer, *aggs_and_cols
-                )
+        _extend_axis1_xconst(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys, antialias_stage_2, *aggs_and_cols)
+
+    header2 = (
+        "def extend_axis1_xconst_aa2(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys, antialias_stage_2, aggs_and_accums, " + args_join + "):"
+    )
+    body2 = [
+        "    antialias = antialias_stage_2 is not None",
+        "    buffer = np.empty(8) if antialias else None",
+        shape_def,
+        "    for i in range(nrows):",
+        "        for j in range(ncols - 1):",
+        "            x0 = xs[j]; x1 = xs[j + 1]",
+        f"            {y0y1}",
+        f"            {seg_start}",
+        f"            {seg_end}",
+        f"            draw_segment(i, sx, tx, sy, ty, xmin, xmax, ymin, ymax, segment_start, segment_end, x0, x1, y0, y1, 0.0, 0.0, buffer, {args_join})",
+        "        if nrows == 1:",
+        "            aa_stage_2_copy_back(aggs_and_accums)",
+        "            return",
+        "        aa_stage_2_accumulate(aggs_and_accums, i==0)",
+        "        if i < nrows - 1:",
+        "            aa_stage_2_clear(aggs_and_accums)",
+        "    aa_stage_2_copy_back(aggs_and_accums)",
+    ]
+    _extend_axis1_xconst_aa2 = _cache_emit_njit(
+        "extend_axis1_xconst_aa2", [header2] + body2,
+        ["extend_axis1_xconst_aa2", ("n_extra", n_extra), ("ds", _ds_key), ("sw", int(swap_dims))],
+        bindings={
+            "draw_segment": draw_segment,
+            "isnull": isnull,
+            "np": np,
+            "aa_stage_2_accumulate": aa_stage_2_accumulate if use_2_stage_agg else None,
+            "aa_stage_2_clear": aa_stage_2_clear if use_2_stage_agg else None,
+            "aa_stage_2_copy_back": aa_stage_2_copy_back if use_2_stage_agg else None,
+        },
+    )
 
     def extend_cpu_antialias_2agg(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys,
                                   antialias_stage_2, *aggs_and_cols):
         n_aggs = len(antialias_stage_2[0])
         aggs_and_accums = tuple((agg, agg.copy()) for agg in aggs_and_cols[:n_aggs])
-        cpu_antialias_2agg_impl(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys,
-                                antialias_stage_2, aggs_and_accums, *aggs_and_cols)
-
-    @ngjit
-    @expand_aggs_and_cols
-    def cpu_antialias_2agg_impl(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys,
-                                antialias_stage_2, aggs_and_accums, *aggs_and_cols):
-        antialias = antialias_stage_2 is not None
-        buffer = np.empty(8) if antialias else None
-
-        ncols = ys.shape[1]
-        for i in range(ys.shape[0]):
-            for j in range(ncols - 1):
-                perform_extend_line(
-                    i, j, sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys,
-                    buffer, *aggs_and_cols
-                )
-
-            if ys.shape[0] == 1:
-                return
-
-            aa_stage_2_accumulate(aggs_and_accums, i==0)
-
-            if i < ys.shape[0] - 1:
-                aa_stage_2_clear(aggs_and_accums)
-
-        aa_stage_2_copy_back(aggs_and_accums)
-
-    @cuda.jit
-    @expand_aggs_and_cols
-    def extend_cuda(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys, antialias_stage_2,
-                    *aggs_and_cols):
-        antialias = antialias_stage_2 is not None
-        buffer = cuda.local.array(8, nb_types.float64) if antialias else None
-        i, j = cuda.grid(2)
-        ncols, nrows = ys.shape if swap_dims else ys.shape[::-1]
-        if i < nrows and j < ncols - 1:
-            perform_extend_line(
-                i, j, sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys, buffer, *aggs_and_cols
-            )
+        _extend_axis1_xconst_aa2(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys, antialias_stage_2, aggs_and_accums, *aggs_and_cols)
 
     if use_2_stage_agg:
-        return extend_cpu_antialias_2agg, extend_cuda
+        return extend_cpu_antialias_2agg, None
     else:
-        return extend_cpu, extend_cuda
+        return extend_cpu, None
 
 
 def _build_extend_line_axis1_y_constant(draw_segment, expand_aggs_and_cols,
@@ -1974,103 +2052,182 @@ def _build_extend_line_axis1_y_constant(draw_segment, expand_aggs_and_cols,
         aa_stage_2_accumulate, aa_stage_2_clear, aa_stage_2_copy_back = antialias_stage_2_funcs
     use_2_stage_agg = antialias_stage_2_funcs is not None
 
-    @ngjit
-    @expand_aggs_and_cols
-    def perform_extend_line(
-            i, j, sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys, buffer, *aggs_and_cols
-    ):
-        x0 = xs[i, j]
-        y0 = ys[j]
-        x1 = xs[i, j + 1]
-        y1 = ys[j + 1]
+    # Generate cacheable CPU extend kernels for axis1 (y constant)
+    n_extra = _infer_aggs_cols_len(expand_aggs_and_cols)
+    _ds_key = getattr(draw_segment, "__ds_spec_key__", None)
+    if _ds_key is None:
+        try:
+            _ds_key = draw_segment.py_func.__code__.co_code.hex()[:16]
+        except Exception:
+            _ds_key = repr(draw_segment)[:32]
+    arg_names = [f"_{i}" for i in range(n_extra)]
+    args_join = ", ".join(arg_names)
 
-        segment_start = (
-                (j == 0) or isnull(xs[i, j - 1]) or isnull(ys[j - 1])
-        )
+    header = (
+        "def extend_axis1_yconst(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys, antialias_stage_2, " + args_join + "):"
+    )
+    body = [
+        "    antialias = antialias_stage_2 is not None",
+        "    buffer = np.empty(8) if antialias else None",
+        "    nrows, ncols = xs.shape",
+        "    for i in range(nrows):",
+        "        for j in range(ncols - 1):",
+        "            x0 = xs[i, j]; y0 = ys[j]; x1 = xs[i, j + 1]; y1 = ys[j + 1]",
+        "            segment_start = (j == 0) or isnull(xs[i, j - 1]) or isnull(ys[j - 1])",
+        "            segment_end = (j == len(ys)-2) or isnull(xs[i, j+2]) or isnull(ys[j+2])",
+        "            if segment_start:",
+        "                xm = 0.0; ym = 0.0",
+        "            else:",
+        "                xm = xs[i, j-1]; ym = ys[j-1]",
+        f"            draw_segment(i, sx, tx, sy, ty, xmin, xmax, ymin, ymax, segment_start, segment_end, x0, x1, y0, y1, xm, ym, buffer, {args_join})",
+    ]
+    _extend_axis1_yconst = _cache_emit_njit(
+        "extend_axis1_yconst", [header] + body,
+        ["extend_axis1_yconst", ("n_extra", n_extra), ("ds", _ds_key)],
+        bindings={"draw_segment": draw_segment, "isnull": isnull, "np": np},
+    )
 
-        segment_end = (j == len(ys)-2) or isnull(xs[i, j+2]) or isnull(ys[j+2])
-
-        if segment_start or use_2_stage_agg:
-            xm = 0.0
-            ym = 0.0
-        else:
-            xm = xs[i, j-1]
-            ym = ys[j-1]
-
-        draw_segment(i, sx, tx, sy, ty, xmin, xmax, ymin, ymax,
-                     segment_start, segment_end, x0, x1, y0, y1,
-                     xm, ym, buffer, *aggs_and_cols)
-
-    @ngjit
-    @expand_aggs_and_cols
     def extend_cpu(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys, antialias_stage_2,
                    *aggs_and_cols):
-        antialias = antialias_stage_2 is not None
-        buffer = np.empty(8) if antialias else None
-        ncols = xs.shape[1]
-        for i in range(xs.shape[0]):
-            for j in range(ncols - 1):
-                perform_extend_line(
-                    i, j, sx, tx, sy, ty, xmin, xmax, ymin, ymax,
-                    xs, ys, buffer, *aggs_and_cols
-                )
+        _extend_axis1_yconst(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys, antialias_stage_2, *aggs_and_cols)
+
+    header2 = (
+        "def extend_axis1_yconst_aa2(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys, antialias_stage_2, aggs_and_accums, " + args_join + "):"
+    )
+    body2 = [
+        "    antialias = antialias_stage_2 is not None",
+        "    buffer = np.empty(8) if antialias else None",
+        "    nrows, ncols = xs.shape",
+        "    for i in range(nrows):",
+        "        for j in range(ncols - 1):",
+        "            x0 = xs[i, j]; y0 = ys[j]; x1 = xs[i, j + 1]; y1 = ys[j + 1]",
+        "            segment_start = (j == 0) or isnull(xs[i, j - 1]) or isnull(ys[j - 1])",
+        "            segment_end = (j == len(ys)-2) or isnull(xs[i, j+2]) or isnull(ys[j+2])",
+        f"            draw_segment(i, sx, tx, sy, ty, xmin, xmax, ymin, ymax, segment_start, segment_end, x0, x1, y0, y1, 0.0, 0.0, buffer, {args_join})",
+        "        if nrows == 1:",
+        "            aa_stage_2_copy_back(aggs_and_accums)",
+        "            return",
+        "        aa_stage_2_accumulate(aggs_and_accums, i==0)",
+        "        if i < nrows - 1:",
+        "            aa_stage_2_clear(aggs_and_accums)",
+        "    aa_stage_2_copy_back(aggs_and_accums)",
+    ]
+    _extend_axis1_yconst_aa2 = _cache_emit_njit(
+        "extend_axis1_yconst_aa2", [header2] + body2,
+        ["extend_axis1_yconst_aa2", ("n_extra", n_extra), ("ds", _ds_key)],
+        bindings={
+            "draw_segment": draw_segment,
+            "isnull": isnull,
+            "np": np,
+            "aa_stage_2_accumulate": aa_stage_2_accumulate if use_2_stage_agg else None,
+            "aa_stage_2_clear": aa_stage_2_clear if use_2_stage_agg else None,
+            "aa_stage_2_copy_back": aa_stage_2_copy_back if use_2_stage_agg else None,
+        },
+    )
 
     def extend_cpu_antialias_2agg(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys,
                                   antialias_stage_2, *aggs_and_cols):
         n_aggs = len(antialias_stage_2[0])
         aggs_and_accums = tuple((agg, agg.copy()) for agg in aggs_and_cols[:n_aggs])
-        cpu_antialias_2agg_impl(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys,
-                                antialias_stage_2, aggs_and_accums, *aggs_and_cols)
-
-    @ngjit
-    @expand_aggs_and_cols
-    def cpu_antialias_2agg_impl(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys,
-                                antialias_stage_2, aggs_and_accums, *aggs_and_cols):
-        antialias = antialias_stage_2 is not None
-        buffer = np.empty(8) if antialias else None
-
-        ncols = xs.shape[1]
-        for i in range(xs.shape[0]):
-
-            for j in range(ncols - 1):
-                perform_extend_line(
-                    i, j, sx, tx, sy, ty, xmin, xmax, ymin, ymax,
-                    xs, ys, buffer, *aggs_and_cols
-                )
-
-            if xs.shape[0] == 1:
-                return
-
-            aa_stage_2_accumulate(aggs_and_accums, i==0)
-
-            if i < xs.shape[0] - 1:
-                aa_stage_2_clear(aggs_and_accums)
-
-        aa_stage_2_copy_back(aggs_and_accums)
-
-    @cuda.jit
-    @expand_aggs_and_cols
-    def extend_cuda(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys, antialias_stage_2,
-                    *aggs_and_cols):
-        antialias = antialias_stage_2 is not None
-        buffer = cuda.local.array(8, nb_types.float64) if antialias else None
-        i, j = cuda.grid(2)
-        if i < xs.shape[0] and j < xs.shape[1] - 1:
-            perform_extend_line(
-                i, j, sx, tx, sy, ty, xmin, xmax, ymin, ymax,
-                xs, ys, buffer, *aggs_and_cols
-            )
+        _extend_axis1_yconst_aa2(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys, antialias_stage_2, aggs_and_accums, *aggs_and_cols)
 
     if use_2_stage_agg:
-        return extend_cpu_antialias_2agg, extend_cuda
+        return extend_cpu_antialias_2agg, None
     else:
-        return extend_cpu, extend_cuda
+        return extend_cpu, None
 
 
 def _build_extend_line_axis1_ragged(draw_segment, expand_aggs_and_cols, antialias_stage_2_funcs):
     if antialias_stage_2_funcs is not None:
         aa_stage_2_accumulate, aa_stage_2_clear, aa_stage_2_copy_back = antialias_stage_2_funcs
     use_2_stage_agg = antialias_stage_2_funcs is not None
+
+    # Generate cacheable ragged extend kernels bound to draw_segment
+    n_extra = _infer_aggs_cols_len(expand_aggs_and_cols)
+    arg_names = [f"_{i}" for i in range(n_extra)]
+    args_join = ", ".join(arg_names)
+
+    header = (
+        "def ragged_extend(sx, tx, sy, ty, xmin, xmax, ymin, ymax, "
+        "x_start_i, x_flat, y_start_i, y_flat, antialias_stage_2, " + args_join + "):"
+    )
+    body = [
+        "    antialias = antialias_stage_2 is not None",
+        "    buffer = np.empty(8) if antialias else None",
+        "    nrows = len(x_start_i)",
+        "    x_flat_len = len(x_flat)",
+        "    y_flat_len = len(y_flat)",
+        "    for i in range(nrows):",
+        "        x_start_index = x_start_i[i]",
+        "        x_stop_index = (x_start_i[i + 1] if i < nrows - 1 else x_flat_len)",
+        "        y_start_index = y_start_i[i]",
+        "        y_stop_index = (y_start_i[i + 1] if i < nrows - 1 else y_flat_len)",
+        "        segment_len = min(x_stop_index - x_start_index, y_stop_index - y_start_index)",
+        "        for j in range(segment_len - 1):",
+        "            x0 = x_flat[x_start_index + j]",
+        "            y0 = y_flat[y_start_index + j]",
+        "            x1 = x_flat[x_start_index + j + 1]",
+        "            y1 = y_flat[y_start_index + j + 1]",
+        "            segment_start = ((j == 0) or isnull(x_flat[x_start_index + j - 1]) or isnull(y_flat[y_start_index + j - 1]))",
+        "            segment_end = ((j == segment_len-2) or isnull(x_flat[x_start_index + j + 2]) or isnull(y_flat[y_start_index + j + 2]))",
+        "            if segment_start:",
+        "                xm = 0.0; ym = 0.0",
+        "            else:",
+        "                xm = x_flat[x_start_index + j - 1]",
+        "                ym = y_flat[y_start_index + j - 1]",
+        f"            draw_segment(i, sx, tx, sy, ty, xmin, xmax, ymin, ymax, segment_start, segment_end, x0, x1, y0, y1, xm, ym, buffer, {args_join})",
+    ]
+    _ragged_extend = _cache_emit_njit(
+        "ragged_extend",
+        [header] + body,
+        ["ragged_extend", ("n_extra", n_extra)],
+        bindings={"draw_segment": draw_segment, "isnull": isnull},
+    )
+
+    header2 = (
+        "def ragged_extend_aa2(sx, tx, sy, ty, xmin, xmax, ymin, ymax, "
+        "x_start_i, x_flat, y_start_i, y_flat, antialias_stage_2, aggs_and_accums, " + args_join + "):"
+    )
+    body2 = [
+        "    antialias = antialias_stage_2 is not None",
+        "    buffer = np.empty(8) if antialias else None",
+        "    nrows = len(x_start_i)",
+        "    x_flat_len = len(x_flat)",
+        "    y_flat_len = len(y_flat)",
+        "    for i in range(nrows):",
+        "        x_start_index = x_start_i[i]",
+        "        x_stop_index = (x_start_i[i + 1] if i < nrows - 1 else x_flat_len)",
+        "        y_start_index = y_start_i[i]",
+        "        y_stop_index = (y_start_i[i + 1] if i < nrows - 1 else y_flat_len)",
+        "        segment_len = min(x_stop_index - x_start_index, y_stop_index - y_start_index)",
+        "        for j in range(segment_len - 1):",
+        "            x0 = x_flat[x_start_index + j]",
+        "            y0 = y_flat[y_start_index + j]",
+        "            x1 = x_flat[x_start_index + j + 1]",
+        "            y1 = y_flat[y_start_index + j + 1]",
+        "            segment_start = ((j == 0) or isnull(x_flat[x_start_index + j - 1]) or isnull(y_flat[y_start_index + j - 1]))",
+        "            segment_end = ((j == segment_len-2) or isnull(x_flat[x_start_index + j + 2]) or isnull(y_flat[y_start_index + j + 2]))",
+        f"            draw_segment(i, sx, tx, sy, ty, xmin, xmax, ymin, ymax, segment_start, segment_end, x0, x1, y0, y1, 0.0, 0.0, buffer, {args_join})",
+        "        if nrows == 1:",
+        "            aa_stage_2_copy_back(aggs_and_accums)",
+        "            return",
+        "        aa_stage_2_accumulate(aggs_and_accums, i==0)",
+        "        if i < nrows - 1:",
+        "            aa_stage_2_clear(aggs_and_accums)",
+        "    aa_stage_2_copy_back(aggs_and_accums)",
+    ]
+    _ragged_extend_aa2 = _cache_emit_njit(
+        "ragged_extend_aa2",
+        [header2] + body2,
+        ["ragged_extend_aa2", ("n_extra", n_extra)],
+        bindings={
+            "draw_segment": draw_segment,
+            "isnull": isnull,
+            "aa_stage_2_accumulate": aa_stage_2_accumulate if use_2_stage_agg else None,
+            "aa_stage_2_clear": aa_stage_2_clear if use_2_stage_agg else None,
+            "aa_stage_2_copy_back": aa_stage_2_copy_back if use_2_stage_agg else None,
+        },
+    )
 
     def extend_cpu(
             sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys, antialias_stage_2, *aggs_and_cols
@@ -2081,69 +2238,10 @@ def _build_extend_line_axis1_ragged(draw_segment, expand_aggs_and_cols, antialia
         y_start_i = ys.start_indices
         y_flat = ys.flat_array
 
-        extend_cpu_numba(
+        _ragged_extend(
             sx, tx, sy, ty, xmin, xmax, ymin, ymax,
             x_start_i, x_flat, y_start_i, y_flat, antialias_stage_2, *aggs_and_cols
         )
-
-    @ngjit
-    @expand_aggs_and_cols
-    def extend_cpu_numba(
-            sx, tx, sy, ty, xmin, xmax, ymin, ymax,
-            x_start_i, x_flat, y_start_i, y_flat, antialias_stage_2, *aggs_and_cols
-    ):
-        antialias = antialias_stage_2 is not None
-        buffer = np.empty(8) if antialias else None
-        nrows = len(x_start_i)
-        x_flat_len = len(x_flat)
-        y_flat_len = len(y_flat)
-
-        for i in range(nrows):
-            # Get x index range
-            x_start_index = x_start_i[i]
-            x_stop_index = (x_start_i[i + 1]
-                            if i < nrows - 1
-                            else x_flat_len)
-
-            # Get y index range
-            y_start_index = y_start_i[i]
-            y_stop_index = (y_start_i[i + 1]
-                            if i < nrows - 1
-                            else y_flat_len)
-
-            # Find line segment length as shorter of the two segments
-            segment_len = min(x_stop_index - x_start_index,
-                              y_stop_index - y_start_index)
-
-            for j in range(segment_len - 1):
-
-                x0 = x_flat[x_start_index + j]
-                y0 = y_flat[y_start_index + j]
-                x1 = x_flat[x_start_index + j + 1]
-                y1 = y_flat[y_start_index + j + 1]
-
-                segment_start = (
-                        (j == 0) or
-                        isnull(x_flat[x_start_index + j - 1]) or
-                        isnull(y_flat[y_start_index + j - 1])
-                )
-
-                segment_end = (
-                        (j == segment_len-2) or
-                        isnull(x_flat[x_start_index + j + 2]) or
-                        isnull(y_flat[y_start_index + j + 2])
-                )
-
-                if segment_start or use_2_stage_agg:
-                    xm = 0.0
-                    ym = 0.0
-                else:
-                    xm = x_flat[x_start_index + j - 1]
-                    ym = y_flat[y_start_index + j - 1]
-
-                draw_segment(i, sx, tx, sy, ty, xmin, xmax, ymin, ymax,
-                             segment_start, segment_end, x0, x1, y0, y1,
-                             xm, ym, buffer, *aggs_and_cols)
 
     def extend_cpu_antialias_2agg(
             sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys, antialias_stage_2, *aggs_and_cols
@@ -2157,73 +2255,10 @@ def _build_extend_line_axis1_ragged(draw_segment, expand_aggs_and_cols, antialia
         n_aggs = len(antialias_stage_2[0])
         aggs_and_accums = tuple((agg, agg.copy()) for agg in aggs_and_cols[:n_aggs])
 
-        extend_cpu_numba_antialias_2agg(
+        _ragged_extend_aa2(
             sx, tx, sy, ty, xmin, xmax, ymin, ymax, x_start_i, x_flat,
             y_start_i, y_flat, antialias_stage_2, aggs_and_accums, *aggs_and_cols
         )
-
-    @ngjit
-    @expand_aggs_and_cols
-    def extend_cpu_numba_antialias_2agg(
-            sx, tx, sy, ty, xmin, xmax, ymin, ymax, x_start_i, x_flat,
-            y_start_i, y_flat, antialias_stage_2, aggs_and_accums, *aggs_and_cols
-    ):
-        antialias = antialias_stage_2 is not None
-        buffer = np.empty(8) if antialias else None
-
-        nrows = len(x_start_i)
-        x_flat_len = len(x_flat)
-        y_flat_len = len(y_flat)
-
-        for i in range(nrows):
-            # Get x index range
-            x_start_index = x_start_i[i]
-            x_stop_index = (x_start_i[i + 1]
-                            if i < nrows - 1
-                            else x_flat_len)
-
-            # Get y index range
-            y_start_index = y_start_i[i]
-            y_stop_index = (y_start_i[i + 1]
-                            if i < nrows - 1
-                            else y_flat_len)
-
-            # Find line segment length as shorter of the two segments
-            segment_len = min(x_stop_index - x_start_index,
-                              y_stop_index - y_start_index)
-
-            for j in range(segment_len - 1):
-
-                x0 = x_flat[x_start_index + j]
-                y0 = y_flat[y_start_index + j]
-                x1 = x_flat[x_start_index + j + 1]
-                y1 = y_flat[y_start_index + j + 1]
-
-                segment_start = (
-                        (j == 0) or
-                        isnull(x_flat[x_start_index + j - 1]) or
-                        isnull(y_flat[y_start_index + j - 1])
-                )
-
-                segment_end = (
-                        (j == segment_len-2) or
-                        isnull(x_flat[x_start_index + j + 2]) or
-                        isnull(y_flat[y_start_index + j + 2])
-                )
-
-                draw_segment(i, sx, tx, sy, ty, xmin, xmax, ymin, ymax,
-                             segment_start, segment_end, x0, x1, y0, y1,
-                             0.0, 0.0, buffer, *aggs_and_cols)
-
-            if nrows == 1:
-                return
-
-            aa_stage_2_accumulate(aggs_and_accums, i==0)
-
-            if i < nrows - 1:
-                aa_stage_2_clear(aggs_and_accums)
-
-        aa_stage_2_copy_back(aggs_and_accums)
 
     if use_2_stage_agg:
         return extend_cpu_antialias_2agg
@@ -2236,6 +2271,106 @@ def _build_extend_line_axis1_geometry(draw_segment, expand_aggs_and_cols, antial
         aa_stage_2_accumulate, aa_stage_2_clear, aa_stage_2_copy_back = antialias_stage_2_funcs
     use_2_stage_agg = antialias_stage_2_funcs is not None
 
+    # Generate cacheable spatialpandas geometry extend kernels
+    n_extra = _infer_aggs_cols_len(expand_aggs_and_cols)
+    arg_names = [f"_{i}" for i in range(n_extra)]
+    args_join = ", ".join(arg_names)
+
+    header = (
+        "def geom_extend(sx, tx, sy, ty, xmin, xmax, ymin, ymax, "
+        "values, missing, offsets0, offsets1, eligible_inds, closed_rings, antialias_stage_2, " + args_join + "):"
+    )
+    body = [
+        "    antialias = antialias_stage_2 is not None",
+        "    buffer = np.empty(8) if antialias else None",
+        "    for i in eligible_inds:",
+        "        if missing[i]:",
+        "            continue",
+        "        start0 = offsets0[i]",
+        "        stop0 = offsets0[i + 1]",
+        "        for j in range(start0, stop0):",
+        "            start1 = offsets1[j]",
+        "            stop1 = offsets1[j + 1]",
+        "            for k in range(start1, stop1 - 2, 2):",
+        "                x0 = values[k]",
+        "                if not np.isfinite(x0):",
+        "                    continue",
+        "                y0 = values[k + 1]",
+        "                if not np.isfinite(y0):",
+        "                    continue",
+        "                x1 = values[k + 2]",
+        "                if not np.isfinite(x1):",
+        "                    continue",
+        "                y1 = values[k + 3]",
+        "                if not np.isfinite(y1):",
+        "                    continue",
+        "                segment_start = ((k == start1 and not closed_rings) or (k > start1 and (not np.isfinite(values[k - 2]) or not np.isfinite(values[k - 1]))))",
+        "                segment_end = ((not closed_rings and k == stop1-4) or (k < stop1-4 and (not np.isfinite(values[k + 4]) or not np.isfinite(values[k + 5]))))",
+        "                if segment_start:",
+        "                    xm = 0.0; ym = 0.0",
+        "                elif k == start1 and closed_rings:",
+        "                    xm = values[stop1-4]; ym = values[stop1-3]",
+        "                else:",
+        "                    xm = values[k-2]; ym = values[k-1]",
+        f"                draw_segment(i, sx, tx, sy, ty, xmin, xmax, ymin, ymax, segment_start, segment_end, x0, x1, y0, y1, xm, ym, buffer, {args_join})",
+    ]
+    _geom_extend = _cache_emit_njit(
+        "geom_extend",
+        [header] + body,
+        ["geom_extend", ("n_extra", n_extra)],
+        bindings={"draw_segment": draw_segment, "np": np},
+    )
+
+    header2 = (
+        "def geom_extend_aa2(sx, tx, sy, ty, xmin, xmax, ymin, ymax, "
+        "values, missing, offsets0, offsets1, eligible_inds, closed_rings, antialias_stage_2, aggs_and_accums, " + args_join + "):"
+    )
+    body2 = [
+        "    antialias = antialias_stage_2 is not None",
+        "    buffer = np.empty(8) if antialias else None",
+        "    first_pass = True",
+        "    for i in eligible_inds:",
+        "        if missing[i]:",
+        "            continue",
+        "        start0 = offsets0[i]",
+        "        stop0 = offsets0[i + 1]",
+        "        for j in range(start0, stop0):",
+        "            start1 = offsets1[j]",
+        "            stop1 = offsets1[j + 1]",
+        "            for k in range(start1, stop1 - 2, 2):",
+        "                x0 = values[k]",
+        "                if not np.isfinite(x0):",
+        "                    continue",
+        "                y0 = values[k + 1]",
+        "                if not np.isfinite(y0):",
+        "                    continue",
+        "                x1 = values[k + 2]",
+        "                if not np.isfinite(x1):",
+        "                    continue",
+        "                y1 = values[k + 3]",
+        "                if not np.isfinite(y1):",
+        "                    continue",
+        "                segment_start = ((k == start1 and not closed_rings) or (k > start1 and (not np.isfinite(values[k - 2]) or not np.isfinite(values[k - 1]))))",
+        "                segment_end = ((not closed_rings and k == stop1-4) or (k < stop1-4 and (not np.isfinite(values[k + 4]) or not np.isfinite(values[k + 5]))))",
+        f"                draw_segment(i, sx, tx, sy, ty, xmin, xmax, ymin, ymax, segment_start, segment_end, x0, x1, y0, y1, 0.0, 0.0, buffer, {args_join})",
+        "        aa_stage_2_accumulate(aggs_and_accums, first_pass)",
+        "        first_pass = False",
+        "        aa_stage_2_clear(aggs_and_accums)",
+        "    aa_stage_2_copy_back(aggs_and_accums)",
+    ]
+    _geom_extend_aa2 = _cache_emit_njit(
+        "geom_extend_aa2",
+        [header2] + body2,
+        ["geom_extend_aa2", ("n_extra", n_extra)],
+        bindings={
+            "draw_segment": draw_segment,
+            "np": np,
+            "aa_stage_2_accumulate": aa_stage_2_accumulate if use_2_stage_agg else None,
+            "aa_stage_2_clear": aa_stage_2_clear if use_2_stage_agg else None,
+            "aa_stage_2_copy_back": aa_stage_2_copy_back if use_2_stage_agg else None,
+        },
+    )
+
     def extend_cpu(
             sx, tx, sy, ty, xmin, xmax, ymin, ymax,
             geometry, closed_rings, antialias_stage_2, *aggs_and_cols
@@ -2260,74 +2395,11 @@ def _build_extend_line_axis1_geometry(draw_segment, expand_aggs_and_cols, antial
             # Otherwise, process all indices
             eligible_inds = np.arange(0, len(geometry), dtype='uint32')
 
-        extend_cpu_numba(
+        _geom_extend(
             sx, tx, sy, ty, xmin, xmax, ymin, ymax,
             values, missing, offsets0, offsets1, eligible_inds,
             closed_rings, antialias_stage_2, *aggs_and_cols
         )
-
-    @ngjit_no_cache
-    @expand_aggs_and_cols
-    def extend_cpu_numba(
-            sx, tx, sy, ty, xmin, xmax, ymin, ymax,
-            values, missing, offsets0, offsets1, eligible_inds,
-            closed_rings, antialias_stage_2, *aggs_and_cols
-    ):
-        antialias = antialias_stage_2 is not None
-        buffer = np.empty(8) if antialias else None
-        for i in eligible_inds:
-            if missing[i]:
-                continue
-
-            start0 = offsets0[i]
-            stop0 = offsets0[i + 1]
-
-            for j in range(start0, stop0):
-                start1 = offsets1[j]
-                stop1 = offsets1[j + 1]
-
-                for k in range(start1, stop1 - 2, 2):
-                    x0 = values[k]
-                    if not np.isfinite(x0):
-                        continue
-
-                    y0 = values[k + 1]
-                    if not np.isfinite(y0):
-                        continue
-
-                    x1 = values[k + 2]
-                    if not np.isfinite(x1):
-                        continue
-
-                    y1 = values[k + 3]
-                    if not np.isfinite(y1):
-                        continue
-
-                    segment_start = (
-                            (k == start1 and not closed_rings) or
-                            (k > start1 and
-                             (not np.isfinite(values[k - 2]) or not np.isfinite(values[k - 1])))
-                    )
-
-                    segment_end = (
-                            (not closed_rings and k == stop1-4) or
-                            (k < stop1-4 and
-                             (not np.isfinite(values[k + 4]) or not np.isfinite(values[k + 5])))
-                    )
-
-                    if segment_start or use_2_stage_agg:
-                        xm = 0.0
-                        ym = 0.0
-                    elif k == start1 and closed_rings:
-                        xm = values[stop1-4]
-                        ym = values[stop1-3]
-                    else:
-                        xm = values[k-2]
-                        ym = values[k-1]
-
-                    draw_segment(i, sx, tx, sy, ty, xmin, xmax, ymin, ymax,
-                                 segment_start, segment_end, x0, x1, y0, y1,
-                                 xm, ym, buffer, *aggs_and_cols)
 
     def extend_cpu_antialias_2agg(
             sx, tx, sy, ty, xmin, xmax, ymin, ymax,
@@ -2356,72 +2428,11 @@ def _build_extend_line_axis1_geometry(draw_segment, expand_aggs_and_cols, antial
         n_aggs = len(antialias_stage_2[0])
         aggs_and_accums = tuple((agg, agg.copy()) for agg in aggs_and_cols[:n_aggs])
 
-        extend_cpu_numba_antialias_2agg(
+        _geom_extend_aa2(
             sx, tx, sy, ty, xmin, xmax, ymin, ymax,
             values, missing, offsets0, offsets1, eligible_inds,
             closed_rings, antialias_stage_2, aggs_and_accums, *aggs_and_cols
         )
-
-    @ngjit
-    @expand_aggs_and_cols
-    def extend_cpu_numba_antialias_2agg(
-            sx, tx, sy, ty, xmin, xmax, ymin, ymax,
-            values, missing, offsets0, offsets1, eligible_inds,
-            closed_rings, antialias_stage_2, aggs_and_accums, *aggs_and_cols
-    ):
-        antialias = antialias_stage_2 is not None
-        buffer = np.empty(8) if antialias else None
-
-        first_pass = True
-        for i in eligible_inds:
-            if missing[i]:
-                continue
-
-            start0 = offsets0[i]
-            stop0 = offsets0[i + 1]
-
-            for j in range(start0, stop0):
-                start1 = offsets1[j]
-                stop1 = offsets1[j + 1]
-
-                for k in range(start1, stop1 - 2, 2):
-                    x0 = values[k]
-                    if not np.isfinite(x0):
-                        continue
-
-                    y0 = values[k + 1]
-                    if not np.isfinite(y0):
-                        continue
-
-                    x1 = values[k + 2]
-                    if not np.isfinite(x1):
-                        continue
-
-                    y1 = values[k + 3]
-                    if not np.isfinite(y1):
-                        continue
-
-                    segment_start = (
-                            (k == start1 and not closed_rings) or
-                            (k > start1 and
-                             (not np.isfinite(values[k - 2]) or not np.isfinite(values[k - 1])))
-                    )
-
-                    segment_end = (
-                            (not closed_rings and k == stop1-4) or
-                            (k < stop1-4 and
-                             (not np.isfinite(values[k + 4]) or not np.isfinite(values[k + 5])))
-                    )
-
-                    draw_segment(i, sx, tx, sy, ty, xmin, xmax, ymin, ymax,
-                                 segment_start, segment_end, x0, x1, y0, y1,
-                                 0.0, 0.0, buffer, *aggs_and_cols)
-
-            aa_stage_2_accumulate(aggs_and_accums, first_pass)
-            first_pass = False
-            aa_stage_2_clear(aggs_and_accums)
-
-        aa_stage_2_copy_back(aggs_and_accums)
 
     if use_2_stage_agg:
         return extend_cpu_antialias_2agg
@@ -2474,12 +2485,11 @@ def _build_extend_line_axis1_geopandas(draw_segment, expand_aggs_and_cols, antia
         sx, tx, sy, ty, xmin, xmax, ymin, ymax, geometry, antialias_stage_2, *aggs_and_cols
     ):
         coords, offsets, outer_offsets, closed_rings = _process_geometry(geometry)
-        extend_cpu_numba(
+        _geo_extend(
             sx, tx, sy, ty, xmin, xmax, ymin, ymax, coords, offsets, outer_offsets, closed_rings,
             antialias_stage_2, *aggs_and_cols)
 
-    @ngjit
-    @expand_aggs_and_cols
+    
     def extend_cpu_numba(
             sx, tx, sy, ty, xmin, xmax, ymin, ymax, values, offsets, outer_offsets,
             closed_rings, antialias_stage_2, *aggs_and_cols
@@ -2537,12 +2547,11 @@ def _build_extend_line_axis1_geopandas(draw_segment, expand_aggs_and_cols, antia
         n_aggs = len(antialias_stage_2[0])
         aggs_and_accums = tuple((agg, agg.copy()) for agg in aggs_and_cols[:n_aggs])
 
-        extend_cpu_numba_antialias_2agg(
+        _geo_extend_aa2(
             sx, tx, sy, ty, xmin, xmax, ymin, ymax, coords, offsets, outer_offsets, closed_rings,
             antialias_stage_2, aggs_and_accums, *aggs_and_cols)
 
-    @ngjit
-    @expand_aggs_and_cols
+    
     def extend_cpu_numba_antialias_2agg(
         sx, tx, sy, ty, xmin, xmax, ymin, ymax, values, offsets, outer_offsets,
         closed_rings, antialias_stage_2, aggs_and_accums, *aggs_and_cols
@@ -2595,3 +2604,78 @@ def _build_extend_line_axis1_geopandas(draw_segment, expand_aggs_and_cols, antia
         return extend_cpu_antialias_2agg
     else:
         return extend_cpu
+    # Emit cacheable extend kernels bound to draw_segment
+    _n_extra = _infer_aggs_cols_len(expand_aggs_and_cols)
+    _arg_names = [f"_{i}" for i in range(_n_extra)]
+    _args_join = ", ".join(_arg_names)
+    _header = (
+        "def geo_extend(sx, tx, sy, ty, xmin, xmax, ymin, ymax, values, offsets, outer_offsets, closed_rings, antialias_stage_2, " + _args_join + "):"
+    )
+    _body = [
+        "    antialias = antialias_stage_2 is not None",
+        "    buffer = np.empty(8) if antialias else None",
+        "    n_multilines = len(outer_offsets) - 1",
+        "    for i in range(n_multilines):",
+        "        start0 = outer_offsets[i]",
+        "        stop0 = outer_offsets[i + 1]",
+        "        for j in range(start0, stop0):",
+        "            start1 = offsets[j]",
+        "            stop1 = offsets[j + 1]",
+        "            for k in range(2*start1, 2*stop1 - 2, 2):",
+        "                x0 = values[k]; y0 = values[k + 1]; x1 = values[k + 2]; y1 = values[k + 3]",
+        "                if not (np.isfinite(x0) and np.isfinite(y0) and np.isfinite(x1) and np.isfinite(y1)):",
+        "                    continue",
+        "                segment_start = ((k == 2*start1 and not closed_rings) or (k > 2*start1 and (not np.isfinite(values[k - 2]) or not np.isfinite(values[k - 1]))))",
+        "                segment_end = ((not closed_rings and k == 2*stop1-4) or (k < 2*stop1-4 and (not np.isfinite(values[k + 4]) or not np.isfinite(values[k + 5]))))",
+        "                if segment_start:",
+        "                    xm = 0.0; ym = 0.0",
+        "                elif k == 2*start1 and closed_rings:",
+        "                    xm = values[2*stop1-4]; ym = values[2*stop1-3]",
+        "                else:",
+        "                    xm = values[k-2]; ym = values[k-1]",
+        f"                draw_segment(i, sx, tx, sy, ty, xmin, xmax, ymin, ymax, segment_start, segment_end, x0, x1, y0, y1, xm, ym, buffer, {_args_join})",
+    ]
+    _geo_extend = _cache_emit_njit(
+        "geo_extend",
+        [_header] + _body,
+        ["geo_extend", ("n_extra", _n_extra)],
+        bindings={"draw_segment": draw_segment, "np": np},
+    )
+    _header2 = (
+        "def geo_extend_aa2(sx, tx, sy, ty, xmin, xmax, ymin, ymax, values, offsets, outer_offsets, closed_rings, antialias_stage_2, aggs_and_accums, " + _args_join + "):"
+    )
+    _body2 = [
+        "    antialias = antialias_stage_2 is not None",
+        "    buffer = np.empty(8) if antialias else None",
+        "    n_multilines = len(outer_offsets) - 1",
+        "    first_pass = True",
+        "    for i in range(n_multilines):",
+        "        start0 = outer_offsets[i]",
+        "        stop0 = outer_offsets[i + 1]",
+        "        for j in range(start0, stop0):",
+        "            start1 = offsets[j]",
+        "            stop1 = offsets[j + 1]",
+        "            for k in range(2*start1, 2*stop1 - 2, 2):",
+        "                x0 = values[k]; y0 = values[k + 1]; x1 = values[k + 2]; y1 = values[k + 3]",
+        "                if not (np.isfinite(x0) and np.isfinite(y0) and np.isfinite(x1) and np.isfinite(y1)):",
+        "                    continue",
+        "                segment_start = ((k == 2*start1 and not closed_rings) or (k > 2*start1 and (not np.isfinite(values[k - 2]) or not np.isfinite(values[k - 1]))))",
+        "                segment_end = ((not closed_rings and k == 2*stop1-4) or (k < 2*stop1-4 and (not np.isfinite(values[k + 4]) or not np.isfinite(values[k + 5]))))",
+        f"                draw_segment(i, sx, tx, sy, ty, xmin, xmax, ymin, ymax, segment_start, segment_end, x0, x1, y0, y1, 0.0, 0.0, buffer, {_args_join})",
+        "        aa_stage_2_accumulate(aggs_and_accums, first_pass)",
+        "        first_pass = False",
+        "        aa_stage_2_clear(aggs_and_accums)",
+        "    aa_stage_2_copy_back(aggs_and_accums)",
+    ]
+    _geo_extend_aa2 = _cache_emit_njit(
+        "geo_extend_aa2",
+        [_header2] + _body2,
+        ["geo_extend_aa2", ("n_extra", _n_extra)],
+        bindings={
+            "draw_segment": draw_segment,
+            "np": np,
+            "aa_stage_2_accumulate": aa_stage_2_accumulate if use_2_stage_agg else None,
+            "aa_stage_2_clear": aa_stage_2_clear if use_2_stage_agg else None,
+            "aa_stage_2_copy_back": aa_stage_2_copy_back if use_2_stage_agg else None,
+        },
+    )

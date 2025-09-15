@@ -54,10 +54,12 @@ class VisibleDeprecationWarning(UserWarning):
     """
 
 
-#-----this is the old code------
-# ngjit = nb.jit(nopython=True, nogil=True)
-# ngjit_parallel = nb.jit(nopython=True, nogil=True, parallel=True)
-#-----------------------------
+# Numba JIT helpers
+# Use non-caching JIT for nested/dynamically-defined functions to avoid
+# "no locator available" cache errors. Disk caching is handled explicitly
+# for generated kernels via _cache_emit_njit.
+# For generated kernels we use explicit cached emission. For nested helpers,
+# we allow caching to enable persistent reuse when safe.
 ngjit = nb.jit(cache=True)
 ngjit_no_cache = nb.jit(cache=False)  # For functions with dynamic globals
 ngjit_parallel = nb.jit(parallel=True, cache=True)
