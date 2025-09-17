@@ -2208,6 +2208,9 @@ class _max_row_index(_max_or_min_row_index):
     user code. It is primarily purpose is to support the use of ``last``
     reductions using dask and/or CUDA.
     """
+    def _antialias_requires_2_stages(self):
+        return True
+
     def _antialias_stage_2(self, self_intersect, array_module) -> tuple[AntialiasStage2]:
         return (AntialiasStage2(AntialiasCombination.MAX, -1),)
 

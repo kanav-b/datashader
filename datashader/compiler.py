@@ -355,8 +355,8 @@ def make_antialias_stage_2_functions(antialias_stage_2, bases, cuda, partitioned
     # Build a spec key sensitive to AA settings and the chosen combine funcs
     spec_parts = [
         "aa_stage_2_accumulate",
-        # Exclude dynamic function names for stable cache keys
-        # tuple(str(f.__name__) for f in funcs),
+        # Include function names for correct cache separation between different aggregations
+        tuple(str(f.__name__) for f in funcs),
         tuple(bool(b) for b in base_is_where),
         tuple(bool(n) for n in next_base_is_where),
         tuple(bool(c) for c in aa_categorical),

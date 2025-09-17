@@ -467,12 +467,12 @@ def _line_internal_build_extend(
     if not use_2_stage_agg:
         antialias_stage_2_funcs = None
     draw_segment = _build_draw_segment_generated(
-        append, x_mapper, y_mapper, map_onto_pixel, expand_aggs_and_cols, line_width, overwrite,
+        append, x_mapper, y_mapper, map_onto_pixel, expand_aggs_and_cols, line_width, overwrite, antialias_stage_2,
     )
     return draw_segment, antialias_stage_2_funcs
 
 
-def _build_draw_segment_generated(append, x_mapper, y_mapper, map_onto_pixel, expand_aggs_and_cols, line_width, overwrite):
+def _build_draw_segment_generated(append, x_mapper, y_mapper, map_onto_pixel, expand_aggs_and_cols, line_width, overwrite, antialias_stage_2):
     """Build a cacheable draw_segment specialized by AA and mappers."""
     antialias = line_width > 0.0
 
@@ -496,6 +496,26 @@ def _build_draw_segment_generated(append, x_mapper, y_mapper, map_onto_pixel, ex
         ym_id = getattr(y_mapper, 'py_func', y_mapper).__code__.co_code.hex()[:16]
     except Exception:
         ym_id = repr(y_mapper)[:32]
+
+    # Include antialias_stage_2 information in cache key to ensure different aggregations get different draw_segment functions
+    stage_2_key = None
+    try:
+        if antialias_stage_2:
+            # antialias_stage_2 is a tuple of tuples: (combinations, zeros, n_reductions, categorical)
+            combinations, zeros, n_reductions, categorical = antialias_stage_2
+            # Create a key from the combinations (which differentiate MAX vs MIN)
+            stage_2_parts = []
+            for combination in combinations:
+                stage_2_parts.append(str(combination))
+            stage_2_key = "_".join(stage_2_parts)[:32] if stage_2_parts else "none"
+
+        else:
+            stage_2_key = "none"
+    except Exception:
+        stage_2_key = str(antialias_stage_2)[:16] if antialias_stage_2 else "none"
+
+
+
 
     if antialias:
         body = [
@@ -524,6 +544,7 @@ def _build_draw_segment_generated(append, x_mapper, y_mapper, map_onto_pixel, ex
             ("ow", bool(overwrite)),
             ("xm", xm_id),
             ("ym", ym_id),
+            ("stage_2", stage_2_key),
         ]
         bindings = {
             "x_mapper": x_mapper,
@@ -555,6 +576,7 @@ def _build_draw_segment_generated(append, x_mapper, y_mapper, map_onto_pixel, ex
             ("aa", False),
             ("xm", xm_id),
             ("ym", ym_id),
+            ("stage_2", stage_2_key),
         ]
         bindings = {
             "x_mapper": x_mapper,
@@ -1558,9 +1580,20 @@ def _build_full_antialias(expand_aggs_and_cols, append):
     ]
 
     lines = [header] + body
+
+    # Include append function in cache key to ensure different aggregations get different full_aa functions
+    append_key = None
+    try:
+        # Use the append function's memory address to create a unique key
+        append_key = hex(id(append))[-8:]  # Last 8 chars of memory address
+
+    except Exception:
+        append_key = str(append)[:16]
+
     spec_parts = [
         "full_aa",
         ("n_extra", n_extra),
+        ("append", append_key),
     ]
     full = _cache_emit_njit(
         "full_aa", lines, spec_parts,
@@ -1634,9 +1667,22 @@ def _build_bresenham(expand_aggs_and_cols, append):
     ]
 
     lines = [header] + body
+
+    # Include append function in cache key to ensure different aggregations get different bresenham functions
+    append_key = None
+    try:
+        # Use the append function's code or memory address to create a unique key
+        if hasattr(append, 'py_func'):
+            append_key = append.py_func.__code__.co_code.hex()[:16]
+        else:
+            append_key = hex(id(append))[-8:]  # Last 8 chars of memory address
+    except Exception:
+        append_key = str(append)[:16]
+
     spec_parts = [
         "bresenham",
         ("n_extra", n_extra),  # number of fixed aggs_and_cols args
+        ("append", append_key),  # append function identifier
     ]
     # Emit cacheable kernel
     # Bind the numba-compiled append dispatcher into module scope to avoid
@@ -1651,7 +1697,7 @@ def _build_draw_segment(append, map_onto_pixel, expand_aggs_and_cols, line_width
     raise RuntimeError("_build_draw_segment legacy overload should not be called")
 
 def _build_extend_line_axis0(draw_segment, expand_aggs_and_cols, antialias_stage_2_funcs):
-    print('DEBUG: entering _build_extend_line_axis0')
+
     use_2_stage_agg = antialias_stage_2_funcs is not None
 
     # Generate cacheable CPU extend kernels
@@ -1705,9 +1751,21 @@ def _build_extend_line_axis0(draw_segment, expand_aggs_and_cols, antialias_stage
         "    aa_stage_2_accumulate(aggs_and_accums, True)",
         "    aa_stage_2_copy_back(aggs_and_accums)",
     ]
+    # Include antialias_stage_2_funcs in cache key to ensure different aggregations get different cached functions
+    aa2_key = None
+    if use_2_stage_agg:
+        try:
+            # Use the function memory addresses to create a unique key for the 2-stage functions
+            aa2_key = (
+                hex(id(antialias_stage_2_funcs[0]))[-8:],  # Last 8 chars of memory address
+                hex(id(antialias_stage_2_funcs[2]))[-8:],  # Last 8 chars of memory address
+            )
+        except Exception:
+            aa2_key = str(antialias_stage_2_funcs)[:32]
+
     _extend_axis0_aa2 = _cache_emit_njit(
         "extend_axis0_aa2", [header2] + body2,
-        ["extend_axis0_aa2", ("n_extra", n_extra), ("ds", _ds_key)],
+        ["extend_axis0_aa2", ("n_extra", n_extra), ("ds", _ds_key), ("aa2", aa2_key)],
         bindings={
             "draw_segment": draw_segment,
             "isnull": isnull,
@@ -1721,6 +1779,12 @@ def _build_extend_line_axis0(draw_segment, expand_aggs_and_cols, antialias_stage
                    xs, ys, plot_start, antialias_stage_2, *aggs_and_cols):
         _extend_axis0(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys, plot_start, antialias_stage_2, *aggs_and_cols)
 
+    def extend_cpu_antialias_2agg(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys,
+                                  plot_start, antialias_stage_2, *aggs_and_cols):
+        n_aggs = len(antialias_stage_2[0])
+        aggs_and_accums = tuple((agg, agg.copy()) for agg in aggs_and_cols[:n_aggs])
+        _extend_axis0_aa2(sx, tx, sy, ty, xmin, xmax, ymin, ymax, xs, ys, plot_start, antialias_stage_2, aggs_and_accums, *aggs_and_cols)
+
     @cuda.jit
     @expand_aggs_and_cols
     def extend_cuda(sx, tx, sy, ty, xmin, xmax, ymin, ymax,
@@ -1732,7 +1796,10 @@ def _build_extend_line_axis0(draw_segment, expand_aggs_and_cols, antialias_stage
             perform_extend_line(i, sx, tx, sy, ty, xmin, xmax, ymin, ymax,
                                 plot_start, xs, ys, buffer, *aggs_and_cols)
 
-    return extend_cpu, extend_cuda
+    if use_2_stage_agg:
+        return extend_cpu_antialias_2agg, extend_cuda
+    else:
+        return extend_cpu, extend_cuda
 
 
 def _build_extend_line_axis0_multi(draw_segment, expand_aggs_and_cols, antialias_stage_2_funcs):

@@ -35,13 +35,13 @@ def two_stage_agg(antialias_stage_2: UnzippedAntialiasStage2 | None):
 
     aa_combinations = antialias_stage_2[0]
 
-    # A single combination in (SUM_2AGG, FIRST, LAST, MIN) means that a 2-stage
+    # A single combination in (SUM_2AGG, FIRST, LAST, MIN, MAX) means that a 2-stage
     # aggregation will be used, otherwise use a 1-stage aggregation that is
     # faster.
     use_2_stage_agg = False
     for comb in aa_combinations:
         if comb in (AntialiasCombination.SUM_2AGG, AntialiasCombination.MIN,
-                    AntialiasCombination.FIRST, AntialiasCombination.LAST):
+                    AntialiasCombination.MAX, AntialiasCombination.FIRST, AntialiasCombination.LAST):
             use_2_stage_agg = True
             break
 
