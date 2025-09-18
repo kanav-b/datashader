@@ -357,6 +357,8 @@ def make_antialias_stage_2_functions(antialias_stage_2, bases, cuda, partitioned
         "aa_stage_2_accumulate",
         # Include function names for correct cache separation between different aggregations
         tuple(str(f.__name__) for f in funcs),
+        # Include combination enum values to distinguish SUM_1AGG vs SUM_2AGG etc.
+        tuple(str(comb) for comb in aa_combinations),
         tuple(bool(b) for b in base_is_where),
         tuple(bool(n) for n in next_base_is_where),
         tuple(bool(c) for c in aa_categorical),
@@ -366,6 +368,7 @@ def make_antialias_stage_2_functions(antialias_stage_2, bases, cuda, partitioned
         lines,
         spec_parts,
         extra_imports=["# namespace helpers are resolved via imports above"],
+        bindings=namespace,
     )
 
     # aa_stage_2_clear

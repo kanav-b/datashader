@@ -542,6 +542,7 @@ def _build_draw_segment_generated(append, x_mapper, y_mapper, map_onto_pixel, ex
             ("n_extra", n_extra),
             ("aa", True),
             ("ow", bool(overwrite)),
+            ("lw", float(line_width)),  # Include line width in cache key
             ("xm", xm_id),
             ("ym", ym_id),
             ("stage_2", stage_2_key),

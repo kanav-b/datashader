@@ -586,10 +586,11 @@ class count(SelfIntersectingOptionalFieldReduction):
     @staticmethod
     @ngjit
     def _append_no_field_antialias(x, y, agg, aa_factor, prev_aa_factor):
+        value = aa_factor - prev_aa_factor
         if isnull(agg[y, x]):
-            agg[y, x] = aa_factor - prev_aa_factor
+            agg[y, x] = value
         else:
-            agg[y, x] += aa_factor - prev_aa_factor
+            agg[y, x] += value
         return 0
 
     @staticmethod
@@ -599,6 +600,8 @@ class count(SelfIntersectingOptionalFieldReduction):
             agg[y, x] = aa_factor
             return 0
         return -1
+
+
 
     # GPU append functions
     @staticmethod
@@ -649,6 +652,8 @@ class count(SelfIntersectingOptionalFieldReduction):
         else:
             return self._combine
 
+
+
     @staticmethod
     def _combine(aggs):
         return aggs.sum(axis=0, dtype='u4')
@@ -670,6 +675,19 @@ class _count_ignore_antialiasing(count):
     def out_dshape(self, in_dshape, antialias, cuda, partitioned):
         return dshape(ct.uint32)
 
+    def _build_create(self, required_dshape):
+        # Override parent's NaN initialization - this class should use zeros
+        # because it ignores antialiasing and needs to count all pixels
+        if isinstance(required_dshape, Option):
+            required_dshape = dshape(required_dshape.ty)
+
+        if required_dshape == dshape(ct.uint32):
+            # Use original zero initialization for this special case
+            return self._create_uint32
+        else:
+            # Fallback to parent's parent implementation (not count's NaN version)
+            return super(count, self)._build_create(required_dshape)
+
     def _antialias_stage_2(self, self_intersect, array_module) -> tuple[AntialiasStage2]:
         if self_intersect:
             return (AntialiasStage2(AntialiasCombination.SUM_1AGG, 0),)
@@ -679,6 +697,7 @@ class _count_ignore_antialiasing(count):
     @staticmethod
     @ngjit
     def _append_antialias(x, y, agg, field, aa_factor, prev_aa_factor):
+        # This class ignores antialiasing - just count once per pixel
         if not isnull(field) and prev_aa_factor == 0.0:
             agg[y, x] += 1
             return 0
@@ -687,10 +706,54 @@ class _count_ignore_antialiasing(count):
     @staticmethod
     @ngjit
     def _append_antialias_not_self_intersect(x, y, agg, field, aa_factor, prev_aa_factor):
+        # This class ignores antialiasing - just count once per pixel
         if not isnull(field) and prev_aa_factor == 0.0:
             agg[y, x] += 1
             return 0
         return -1
+
+    @staticmethod
+    @ngjit
+    def _append_no_field_antialias(x, y, agg, aa_factor, prev_aa_factor):
+        # This class ignores antialiasing - just count once per pixel
+        if prev_aa_factor == 0.0:
+            agg[y, x] += 1
+            return 0
+        return -1
+
+    @staticmethod
+    @ngjit
+    def _append_no_field_antialias_not_self_intersect(x, y, agg, aa_factor, prev_aa_factor):
+        # This class ignores antialiasing - just count once per pixel
+        if prev_aa_factor == 0.0:
+            agg[y, x] += 1
+            return 0
+        return -1
+
+    @staticmethod
+    @ngjit
+    def _append_antialias_not_self_intersect(x, y, agg, field, aa_factor, prev_aa_factor):
+        if not isnull(field):
+            if isnull(agg[y, x]) or aa_factor > agg[y, x]:
+                agg[y, x] = aa_factor
+                return 0
+        return -1
+
+    @staticmethod
+    @ngjit
+    def _append(x, y, agg, field):
+        # Use original count behavior (no NaN handling)
+        if not isnull(field):
+            agg[y, x] += 1
+            return 0
+        return -1
+
+    @staticmethod
+    @ngjit
+    def _append_no_field(x, y, agg):
+        # Use original count behavior (no NaN handling)
+        agg[y, x] += 1
+        return 0
 
 
 class by(Reduction):
@@ -769,6 +832,10 @@ class by(Reduction):
     @property
     def nan_check_column(self):
         return self.reduction.nan_check_column
+
+    @property
+    def self_intersect(self):
+        return getattr(self.reduction, 'self_intersect', True)
 
     def uses_cuda_mutex(self) -> UsesCudaMutex:
         return self.reduction.uses_cuda_mutex()
@@ -878,9 +945,14 @@ class any(OptionalFieldReduction):
         else:
             return self._combine
 
+
+
     @staticmethod
     def _combine(aggs):
-        return aggs.sum(axis=0, dtype='bool')
+        # Convert to boolean: any non-NaN value becomes True
+        result = aggs.sum(axis=0, dtype='f4')
+        result = np.where(np.isnan(result), np.nan, 1.0)
+        return result
 
     @staticmethod
     def _combine_antialias(aggs):
@@ -1167,7 +1239,7 @@ class min(FloatingReduction):
         ``NaN`` values in the column are skipped.
     """
     def _antialias_requires_2_stages(self):
-        return True
+        return False
 
     def _antialias_stage_2(self, self_intersect, array_module) -> tuple[AntialiasStage2]:
         return (AntialiasStage2(AntialiasCombination.MIN, array_module.nan),)
@@ -1214,6 +1286,9 @@ class max(FloatingReduction):
         Name of the column to aggregate over. Column data type must be numeric.
         ``NaN`` values in the column are skipped.
     """
+    def _antialias_requires_2_stages(self):
+        return True
+
     def _antialias_stage_2(self, self_intersect, array_module) -> tuple[AntialiasStage2]:
         return (AntialiasStage2(AntialiasCombination.MAX, array_module.nan),)
 
@@ -1233,6 +1308,16 @@ class max(FloatingReduction):
         if not isnull(value) and (isnull(agg[y, x]) or value > agg[y, x]):
             agg[y, x] = value
             return 0
+        return -1
+
+    @staticmethod
+    @ngjit
+    def _append_antialias_not_self_intersect(x, y, agg, field, aa_factor, prev_aa_factor):
+        value = field*aa_factor
+        if not isnull(value):
+            if isnull(agg[y, x]) or value > agg[y, x]:
+                agg[y, x] = value
+                return 0
         return -1
 
     # GPU append functions
