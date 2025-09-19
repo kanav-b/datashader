@@ -1244,14 +1244,6 @@ class min(FloatingReduction):
     def _antialias_stage_2(self, self_intersect, array_module) -> tuple[AntialiasStage2]:
         return (AntialiasStage2(AntialiasCombination.MIN, array_module.nan),)
 
-    def _build_append(self, dshape, schema, cuda, antialias, self_intersect):
-        if antialias and not self_intersect:
-            if cuda:
-                raise NotImplementedError("min reduction with CUDA and antialias not self_intersect")
-            else:
-                return self._append_antialias_not_self_intersect
-        return super()._build_append(dshape, schema, cuda, antialias, self_intersect)
-
     # CPU append functions
     @staticmethod
     @ngjit
@@ -1265,19 +1257,9 @@ class min(FloatingReduction):
     @ngjit
     def _append_antialias(x, y, agg, field, aa_factor, prev_aa_factor):
         value = field*aa_factor
-        if not isnull(value) and (isnull(agg[y, x]) or agg[y, x] > value):
+        if not isnull(value) and (isnull(agg[y, x]) or value > agg[y, x]):
             agg[y, x] = value
             return 0
-        return -1
-
-    @staticmethod
-    @ngjit
-    def _append_antialias_not_self_intersect(x, y, agg, field, aa_factor, prev_aa_factor):
-        value = field*aa_factor
-        if not isnull(value):
-            if isnull(agg[y, x]) or agg[y, x] > value:
-                agg[y, x] = value
-                return 0
         return -1
 
     # GPU append functions
