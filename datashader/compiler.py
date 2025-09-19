@@ -142,7 +142,6 @@ def _cache_emit_njit(func_name: str, lines: list[str], cache_key_parts: list, *,
     return func
 
 
-@memoize
 def compile_components(agg, schema, glyph, *, antialias=False, cuda=False, partitioned=False):
     """Given an ``Aggregation`` object and a schema, return 5 sub-functions
     and information on how to perform the second stage aggregation if

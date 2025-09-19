@@ -537,6 +537,21 @@ def _build_draw_segment_generated(append, x_mapper, y_mapper, map_onto_pixel, ex
             "    ny = round((ymax - ymin) * sy)",
             f"    _full_aa(LINE_WIDTH, OVERWRITE, i, xx0, xx1, yy0, yy1, segment_start, segment_end, xm2, ym2, nx, ny, {args_join})",
         ]
+        # Include append function information in cache key to distinguish different aggregations
+        append_key = None
+        try:
+            # Try to get a stable identifier from the append function
+            if hasattr(append, '__name__'):
+                append_key = append.__name__
+            elif hasattr(append, 'py_func') and hasattr(append.py_func, '__name__'):
+                append_key = append.py_func.__name__
+            else:
+                # Fallback to a hash of the string representation
+                import hashlib
+                append_key = hashlib.md5(str(append).encode()).hexdigest()[:16]
+        except Exception:
+            append_key = "unknown_append"
+
         spec_parts = [
             "draw_segment",
             ("n_extra", n_extra),
@@ -546,6 +561,7 @@ def _build_draw_segment_generated(append, x_mapper, y_mapper, map_onto_pixel, ex
             ("xm", xm_id),
             ("ym", ym_id),
             ("stage_2", stage_2_key),
+            ("append", append_key),  # Include append function identifier
         ]
         bindings = {
             "x_mapper": x_mapper,
@@ -760,7 +776,6 @@ class LineAxis0Multi(_PointLike, _AntiAliasedLine):
         return (self.maybe_expand_bounds(x_extents),
                 self.maybe_expand_bounds(y_extents))
 
-    @memoize
     def _internal_build_extend(
             self, x_mapper, y_mapper, info, append, line_width, antialias_stage_2,
             antialias_stage_2_funcs):
@@ -1583,13 +1598,20 @@ def _build_full_antialias(expand_aggs_and_cols, append):
     lines = [header] + body
 
     # Include append function in cache key to ensure different aggregations get different full_aa functions
+    # Use a stable key based on the append function's properties rather than memory address
     append_key = None
     try:
-        # Use the append function's memory address to create a unique key
-        append_key = hex(id(append))[-8:]  # Last 8 chars of memory address
-
+        # Try to get a stable identifier from the append function
+        if hasattr(append, '__name__'):
+            append_key = append.__name__
+        elif hasattr(append, 'py_func') and hasattr(append.py_func, '__name__'):
+            append_key = append.py_func.__name__
+        else:
+            # Fallback to a hash of the string representation
+            import hashlib
+            append_key = hashlib.md5(str(append).encode()).hexdigest()[:16]
     except Exception:
-        append_key = str(append)[:16]
+        append_key = "unknown_append"
 
     spec_parts = [
         "full_aa",
@@ -1670,15 +1692,20 @@ def _build_bresenham(expand_aggs_and_cols, append):
     lines = [header] + body
 
     # Include append function in cache key to ensure different aggregations get different bresenham functions
+    # Use a stable key based on the append function's properties rather than memory address
     append_key = None
     try:
-        # Use the append function's code or memory address to create a unique key
-        if hasattr(append, 'py_func'):
-            append_key = append.py_func.__code__.co_code.hex()[:16]
+        # Try to get a stable identifier from the append function
+        if hasattr(append, '__name__'):
+            append_key = append.__name__
+        elif hasattr(append, 'py_func') and hasattr(append.py_func, '__name__'):
+            append_key = append.py_func.__name__
         else:
-            append_key = hex(id(append))[-8:]  # Last 8 chars of memory address
+            # Fallback to a hash of the string representation
+            import hashlib
+            append_key = hashlib.md5(str(append).encode()).hexdigest()[:16]
     except Exception:
-        append_key = str(append)[:16]
+        append_key = "unknown_append"
 
     spec_parts = [
         "bresenham",
@@ -1868,9 +1895,55 @@ def _build_extend_line_axis0_multi(draw_segment, expand_aggs_and_cols, antialias
         "            aa_stage_2_clear(aggs_and_accums)",
         "    aa_stage_2_copy_back(aggs_and_accums)",
     ]
+    # For multi-aggregation scenarios, include aggregation type information in cache key
+    # to prevent incorrect cache reuse between different aggregation combinations
+    agg_key = None
+    try:
+        import hashlib
+        key_parts = []
+
+        # Include basic parameters
+        key_parts.append(f"n_extra:{n_extra}")
+        key_parts.append(f"use_2_stage_agg:{use_2_stage_agg}")
+        key_parts.append(f"ds_key:{_ds_key}")
+
+        # For multi-aggregation scenarios, include information about the antialias stage 2 functions
+        # to distinguish between different aggregation combinations
+        if use_2_stage_agg and antialias_stage_2_funcs is not None:
+            # Create a stable identifier based on the aggregation types
+            # We need to distinguish between different combinations of aggregations
+            # but we can't use function string representations as they contain memory addresses
+
+            # Instead, let's use the expand_aggs_and_cols information which should be stable
+            try:
+                # Get information about the aggregation types from expand_aggs_and_cols
+                agg_info = []
+                if hasattr(expand_aggs_and_cols, '__code__'):
+                    # Use the bytecode as a stable identifier
+                    agg_info.append(expand_aggs_and_cols.__code__.co_code.hex()[:16])
+                elif hasattr(expand_aggs_and_cols, 'py_func') and hasattr(expand_aggs_and_cols.py_func, '__code__'):
+                    agg_info.append(expand_aggs_and_cols.py_func.__code__.co_code.hex()[:16])
+                else:
+                    # Fallback to a hash of the function name/type
+                    agg_info.append(str(type(expand_aggs_and_cols).__name__))
+
+                if agg_info:
+                    agg_hash = hashlib.md5("|".join(agg_info).encode()).hexdigest()[:8]
+                    key_parts.append(f"expand_aggs:{agg_hash}")
+            except Exception:
+                # If we can't get stable info, include a marker that this is multi-agg
+                key_parts.append("multi_agg:true")
+
+        # Create a hash of all the key parts
+        combined_key = "|".join(key_parts)
+        agg_key = hashlib.md5(combined_key.encode()).hexdigest()[:12]
+
+    except Exception as e:
+        agg_key = f"error_{hash(str(e)) % 10000:04d}"
+
     _extend_axis0_multi_aa2 = _cache_emit_njit(
         "extend_axis0_multi_aa2", [header2] + body2,
-        ["extend_axis0_multi_aa2", ("n_extra", n_extra), ("ds", _ds_key)],
+        ["extend_axis0_multi_aa2", ("n_extra", n_extra), ("ds", _ds_key), ("agg", agg_key)],
         bindings={
             "draw_segment": draw_segment,
             "isnull": isnull,
